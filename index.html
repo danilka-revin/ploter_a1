@@ -9,18 +9,29 @@
   <link href="https://fonts.googleapis.com/css2?family=Caveat:wght@400;700&family=Marck+Script&family=Lobster&family=Pacifico&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="style.css">
 </head>
-<body>
+<body data-theme="light">
+  <div class="theme-toggle">
+    <button onclick="toggleTheme()" aria-label="Переключить тему">🌙 Тёмная</button>
+  </div>
+
   <div class="container">
     <header>
       <h1>✏️ Почерк A1</h1>
-      <p>Принтер Bambu Lab A1 с ручкой. Введи текст домашки — настрой вид — получи файл для печати.</p>
+      <p>Принтер Bambu Lab A1 с ручкой. Тёмная тема + анимация + случайные буквы из твоих фото.</p>
     </header>
 
     <main class="grid">
       <section class="panel">
         <h2>📝 Текст домашки</h2>
-        <textarea id="textInput" rows="6" placeholder="Напиши текст, который принтер должен написать ручкой...">Домашнее задание по русскому языку.
+        <textarea id="textInput" rows="6" placeholder="Напиши текст или выбери готовый шаблон...">Домашнее задание по русскому языку.
 Выполнил самостоятельно.</textarea>
+
+        <div class="quick-texts">
+          <span>Быстрые шаблоны:</span>
+          <button class="tag-btn" onclick="setText('Домашнее задание по русскому языку. Выполнил самостоятельно.')">Домашка</button>
+          <button class="tag-btn" onclick="setText('Сочинение на тему «Осень». Природа готовится к зиме.')">Сочинение</button>
+          <button class="tag-btn" onclick="setText('Упражнение №45. Подчеркни существительные.')">Упражнение</button>
+        </div>
 
         <h2>📷 Образец почерка (по желанию)</h2>
         <label class="upload-label">
@@ -28,6 +39,20 @@
           <span class="btn">📎 Загрузить фото почерка</span>
         </label>
         <div id="samplePreview" class="sample-preview hidden"></div>
+
+        <h2>🔤 Случайные буквы из фото</h2>
+        <p class="small">Загрузи несколько фото буквы «м» (или любой другой). Они будут случайно вставляться в текст, чтобы почерк выглядел живым.</p>
+        <label class="upload-label">
+          <input type="file" id="letterUpload" accept="image/*" multiple hidden>
+          <span class="btn">📎 Загрузить варианты буквы «м»</span>
+        </label>
+        <div id="letterGallery" class="letter-gallery"></div>
+        <select id="randomLetter" style="margin-top:0.5rem; width:100%; padding:0.4rem;">
+          <option value="м">Буква для рандомизации: м</option>
+          <option value="а">а</option>
+          <option value="о">о</option>
+          <option value="е">е</option>
+        </select>
 
         <h2>🎨 Настройка почерка</h2>
         <div class="controls">
@@ -38,6 +63,17 @@
               <option value="'Marck Script', cursive">Marck Script (русский)</option>
               <option value="'Lobster', cursive">Lobster (красивый)</option>
               <option value="'Pacifico', cursive">Pacifico (мягкий)</option>
+            </select>
+          </label>
+
+          <label>
+            <span>Фон бумаги</span>
+            <select id="bgSelect" onchange="draw()">
+              <option value="lines">Тетрадь в линейку</option>
+              <option value="grid">Клетка</option>
+              <option value="dots">Точки</option>
+              <option value="old">Старая бумага</option>
+              <option value="blank">Чистая бумага</option>
             </select>
           </label>
 
@@ -76,6 +112,13 @@
             <input type="color" id="inkColor" value="#1a1a2e">
           </label>
         </div>
+
+        <div class="animation-toggle">
+          <label>
+            <input type="checkbox" id="animCheck" onchange="draw()">
+            <span>✏️ Анимация ручки (предпросмотр)</span>
+          </label>
+        </div>
       </section>
 
       <section class="panel">
@@ -85,13 +128,13 @@
           <img id="sampleOverlay" class="sample-overlay hidden" alt="Образец почерка">
         </div>
         <div class="actions">
-          <button class="btn primary" onclick="exportSVG()">⬇ Скачать SVG</button>
-          <button class="btn" onclick="exportGCode()">⬇ Скачать G-код</button>
-          <button class="btn secondary" onclick="printPage()">🖨 Печать / Экспорт</button>
+          <button class="btn primary" onclick="exportSVG()">⬇ SVG</button>
+          <button class="btn" onclick="exportGCode()">⬇ G-код</button>
+          <button class="btn secondary" onclick="printPage()">🖨 Печать</button>
+          <button class="btn" onclick="startAnimation()">▶ Анимация</button>
         </div>
         <p class="hint">
-          💡 SVG — готовый файл для принтера или конвертации в G-код.<br>
-          G-код генерируется через Python-скрипт <code>convert_svg_to_gcode.py</code>.
+          💡 Анимация показывает, как ручка пишет текст. Для принтера используй SVG или запускай <code>python3 convert_svg_to_gcode.py file.svg</code>.
         </p>
       </section>
     </main>
@@ -99,12 +142,13 @@
     <section class="instructions">
       <h2>📋 Как использовать с Bambu Lab A1</h2>
       <ol>
-        <li>Введи текст домашки в поле слева.</li>
-        <li>Настрой внешний вид с помощью ползунков (наклон, размер, расстояние, толщина).</li>
-        <li>По желанию загрузи фото своего почерка для сравнения.</li>
-        <li>Нажми «Скачать SVG» или «Скачать G-код».</li>
-        <li>Для G-кода: запусти <code>python3 convert_svg_to_gcode.py output.svg</code>.</li>
-        <li>Загрузи G-код в принтер с ручкой и печатай на бумаге.</li>
+        <li>Введи текст (или выбери шаблон).</li>
+        <li>Загрузи несколько фото буквы «м» — текст станет живее благодаря случайной вставке.</li>
+        <li>Настрой почерк и фон бумаги.</li>
+        <li>Нажми «Анимация», чтобы увидеть, как ручка пишет.</li>
+        <li>Скачай SVG или G-код.</li>
+        <li>Запусти <code>python3 convert_svg_to_gcode.py file.svg</code> для G-кода.</li>
+        <li>Загрузи в принтер Bambu Lab A1 с ручкой.</li>
       </ol>
     </section>
   </div>

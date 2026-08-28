@@ -1,10 +1,72 @@
+/* === Базовые переменные (светлая тема) === */
+:root {
+  --bg: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+  --surface: #fff;
+  --text: #222;
+  --text-subtle: #555;
+  --border: #dde3ec;
+  --primary: #6c7ae0;
+  --primary-hover: #4a5ad1;
+  --accent: #1a1a2e;
+  --accent-hover: #2e2e4a;
+  --shadow: rgba(26, 26, 46, 0.08);
+  --canvas-bg: #fffdf5;
+  --hint-bg: #f5f7fa;
+  --line-color: #e8dcc8;
+  --btn-secondary-bg: #e3e8f0;
+  --btn-secondary-color: #1a1a2e;
+}
+
+/* === Тёмная тема === */
+[data-theme="dark"] {
+  --bg: linear-gradient(135deg, #0f0f1a 0%, #1a1a2e 100%);
+  --surface: #16162a;
+  --text: #e8e8f0;
+  --text-subtle: #a0a0b0;
+  --border: #2e2e4a;
+  --primary: #7a8cf5;
+  --primary-hover: #5a6ce0;
+  --accent: #e8e8f0;
+  --accent-hover: #fff;
+  --shadow: rgba(0,0,0,0.35);
+  --canvas-bg: #1a1525;
+  --hint-bg: #1f1f35;
+  --line-color: #2a2235;
+  --btn-secondary-bg: #2a2a40;
+  --btn-secondary-color: #e8e8f0;
+}
+
 * { margin: 0; padding: 0; box-sizing: border-box; }
+
 body {
   font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-  background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-  color: #222;
+  background: var(--bg);
+  color: var(--text);
   min-height: 100vh;
   line-height: 1.6;
+  transition: background 0.4s ease, color 0.4s ease;
+}
+
+.theme-toggle {
+  position: fixed;
+  top: 1rem;
+  right: 1.5rem;
+  z-index: 1000;
+}
+.theme-toggle button {
+  background: var(--surface);
+  color: var(--text);
+  border: 2px solid var(--border);
+  border-radius: 20px;
+  padding: 0.5rem 1rem;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 4px 15px var(--shadow);
+  transition: all 0.2s ease;
+}
+.theme-toggle button:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 20px var(--shadow);
 }
 
 .container {
@@ -16,16 +78,18 @@ body {
 header {
   text-align: center;
   margin-bottom: 2rem;
+  padding-top: 3rem;
 }
 header h1 {
   font-family: 'Lobster', cursive;
   font-size: 3rem;
-  color: #1a1a2e;
+  color: var(--accent);
   letter-spacing: 0.05em;
+  transition: color 0.4s;
 }
 header p {
   font-size: 1.1rem;
-  color: #555;
+  color: var(--text-subtle);
   margin-top: 0.5rem;
 }
 
@@ -38,22 +102,25 @@ header p {
 
 @media (max-width: 900px) {
   .grid { grid-template-columns: 1fr; }
+  header h1 { font-size: 2rem; }
 }
 
 .panel {
-  background: #fff;
+  background: var(--surface);
   border-radius: 20px;
   padding: 1.5rem;
-  box-shadow: 0 10px 30px rgba(26, 26, 46, 0.08);
-  border: 1px solid rgba(255,255,255,0.4);
+  box-shadow: 0 10px 30px var(--shadow);
+  border: 1px solid rgba(255,255,255,0.08);
+  transition: background 0.4s, box-shadow 0.4s;
 }
 
 .panel h2 {
   font-size: 1.2rem;
   margin-bottom: 1rem;
-  color: #1a1a2e;
-  border-bottom: 2px solid #e3e8f0;
+  color: var(--accent);
+  border-bottom: 2px solid var(--border);
   padding-bottom: 0.5rem;
+  transition: color 0.4s, border-color 0.4s;
 }
 
 textarea {
@@ -61,17 +128,38 @@ textarea {
   font-family: 'Caveat', cursive, sans-serif;
   font-size: 1.2rem;
   padding: 0.75rem;
-  border: 2px solid #dde3ec;
+  border: 2px solid var(--border);
   border-radius: 12px;
   resize: vertical;
   min-height: 120px;
-  background: #fafbfc;
-  transition: border-color 0.2s;
+  background: var(--canvas-bg);
+  color: var(--text);
+  transition: border-color 0.2s, background 0.4s, color 0.4s;
 }
 textarea:focus {
   outline: none;
-  border-color: #6c7ae0;
+  border-color: var(--primary);
 }
+
+.quick-texts {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+  align-items: center;
+}
+.quick-texts span { color: var(--text-subtle); font-size: 0.9rem; }
+.tag-btn {
+  background: var(--primary);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 0.35rem 0.8rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+.tag-btn:hover { background: var(--primary-hover); }
 
 .upload-label {
   display: inline-block;
@@ -86,7 +174,7 @@ textarea:focus {
   padding: 0.7rem 1.2rem;
   border: none;
   border-radius: 10px;
-  background: #6c7ae0;
+  background: var(--primary);
   color: #fff;
   font-size: 1rem;
   font-weight: 600;
@@ -94,11 +182,11 @@ textarea:focus {
   transition: background 0.2s, transform 0.1s;
   text-decoration: none;
 }
-.btn:hover { background: #4a5ad1; transform: translateY(-2px); }
-.btn.primary { background: #1a1a2e; }
-.btn.primary:hover { background: #2e2e4a; }
-.btn.secondary { background: #e3e8f0; color: #1a1a2e; }
-.btn.secondary:hover { background: #d0d7e8; }
+.btn:hover { background: var(--primary-hover); transform: translateY(-2px); }
+.btn.primary { background: var(--accent); }
+.btn.primary:hover { background: var(--accent-hover); }
+.btn.secondary { background: var(--btn-secondary-bg); color: var(--btn-secondary-color); }
+.btn.secondary:hover { background: var(--primary-hover); color: #fff; }
 
 .sample-preview {
   margin-top: 1rem;
@@ -106,7 +194,7 @@ textarea:focus {
   max-height: 180px;
   border-radius: 10px;
   overflow: hidden;
-  border: 2px dashed #dde3ec;
+  border: 2px dashed var(--border);
 }
 .sample-preview img {
   max-width: 100%;
@@ -115,19 +203,37 @@ textarea:focus {
   display: block;
 }
 
+.letter-gallery {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-top: 0.75rem;
+}
+.letter-gallery img {
+  width: 60px;
+  height: 60px;
+  object-fit: contain;
+  border: 2px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  cursor: pointer;
+  transition: border-color 0.2s;
+}
+.letter-gallery img:hover { border-color: var(--primary); }
+
 .preview-wrap {
   position: relative;
-  background: #fff;
-  border: 2px solid #dde3ec;
+  background: var(--canvas-bg);
+  border: 2px solid var(--border);
   border-radius: 14px;
   overflow: hidden;
   min-height: 400px;
+  transition: background 0.4s;
 }
 #previewCanvas {
   width: 100%;
   height: auto;
   display: block;
-  background: #fffdf5; /* бумажный оттенок */
 }
 .sample-overlay {
   position: absolute;
@@ -137,7 +243,7 @@ textarea:focus {
   max-height: 150px;
   opacity: 0.35;
   border-radius: 8px;
-  border: 1px solid #ccc;
+  border: 1px solid var(--border);
   pointer-events: none;
 }
 
@@ -150,7 +256,8 @@ textarea:focus {
 }
 .controls span {
   font-weight: 600;
-  color: #333;
+  color: var(--text);
+  transition: color 0.4s;
 }
 .controls input[type="range"],
 .controls select,
@@ -158,15 +265,30 @@ textarea:focus {
   width: 100%;
   padding: 0.3rem;
   border-radius: 6px;
-  border: 1px solid #dde3ec;
+  border: 1px solid var(--border);
   font-size: 1rem;
+  background: var(--surface);
+  color: var(--text);
+  transition: border-color 0.2s, background 0.4s, color 0.4s;
 }
 .controls output {
   font-family: monospace;
   font-weight: bold;
-  color: #6c7ae0;
+  color: var(--primary);
   align-self: flex-end;
 }
+
+.animation-toggle {
+  margin-top: 1rem;
+  padding: 0.75rem;
+  background: var(--surface);
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.animation-toggle input { width: auto; }
 
 .actions {
   display: flex;
@@ -178,42 +300,42 @@ textarea:focus {
 .hint {
   margin-top: 1rem;
   font-size: 0.9rem;
-  color: #777;
-  background: #f5f7fa;
+  color: var(--text-subtle);
+  background: var(--hint-bg);
   padding: 0.75rem 1rem;
   border-radius: 10px;
+  transition: background 0.4s, color 0.4s;
 }
 .hint code {
-  background: #e3e8f0;
+  background: var(--border);
   padding: 0.1rem 0.35rem;
   border-radius: 4px;
   font-size: 0.85em;
+  color: var(--text);
+  transition: background 0.4s, color 0.4s;
 }
 
 .instructions {
-  background: #fff;
+  background: var(--surface);
   border-radius: 20px;
   padding: 1.5rem;
-  box-shadow: 0 10px 30px rgba(26,26,46,0.08);
+  box-shadow: 0 10px 30px var(--shadow);
+  transition: background 0.4s, box-shadow 0.4s;
 }
 .instructions h2 {
   font-size: 1.3rem;
   margin-bottom: 0.75rem;
-  color: #1a1a2e;
+  color: var(--accent);
 }
-.instructions ol {
-  margin-left: 1.2rem;
-}
-.instructions li {
-  margin-bottom: 0.5rem;
-  color: #444;
-}
+.instructions ol { margin-left: 1.2rem; }
+.instructions li { margin-bottom: 0.5rem; color: var(--text-subtle); transition: color 0.4s; }
 .instructions code {
-  background: #f0f2f8;
+  background: var(--border);
   padding: 0.15rem 0.4rem;
   border-radius: 4px;
   font-size: 0.9em;
-  color: #2e2e4a;
+  color: var(--text);
+  transition: background 0.4s, color 0.4s;
 }
 
 .hidden { display: none !important; }
@@ -223,3 +345,10 @@ textarea:focus {
   .actions { flex-direction: column; }
   .btn { justify-content: center; }
 }
+
+/* === Анимация ручки === */
+@keyframes penMove {
+  0% { stroke-dashoffset: 100; }
+  100% { stroke-dashoffset: 0; }
+}
+.small { font-size: 0.85rem; color: var(--text-subtle); margin-bottom: 0.5rem; }
