@@ -1,0 +1,225 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+  background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+  color: #222;
+  min-height: 100vh;
+  line-height: 1.6;
+}
+
+.container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem;
+}
+
+header {
+  text-align: center;
+  margin-bottom: 2rem;
+}
+header h1 {
+  font-family: 'Lobster', cursive;
+  font-size: 3rem;
+  color: #1a1a2e;
+  letter-spacing: 0.05em;
+}
+header p {
+  font-size: 1.1rem;
+  color: #555;
+  margin-top: 0.5rem;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 2rem;
+  margin-bottom: 2rem;
+}
+
+@media (max-width: 900px) {
+  .grid { grid-template-columns: 1fr; }
+}
+
+.panel {
+  background: #fff;
+  border-radius: 20px;
+  padding: 1.5rem;
+  box-shadow: 0 10px 30px rgba(26, 26, 46, 0.08);
+  border: 1px solid rgba(255,255,255,0.4);
+}
+
+.panel h2 {
+  font-size: 1.2rem;
+  margin-bottom: 1rem;
+  color: #1a1a2e;
+  border-bottom: 2px solid #e3e8f0;
+  padding-bottom: 0.5rem;
+}
+
+textarea {
+  width: 100%;
+  font-family: 'Caveat', cursive, sans-serif;
+  font-size: 1.2rem;
+  padding: 0.75rem;
+  border: 2px solid #dde3ec;
+  border-radius: 12px;
+  resize: vertical;
+  min-height: 120px;
+  background: #fafbfc;
+  transition: border-color 0.2s;
+}
+textarea:focus {
+  outline: none;
+  border-color: #6c7ae0;
+}
+
+.upload-label {
+  display: inline-block;
+  margin-top: 0.5rem;
+  cursor: pointer;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.7rem 1.2rem;
+  border: none;
+  border-radius: 10px;
+  background: #6c7ae0;
+  color: #fff;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s, transform 0.1s;
+  text-decoration: none;
+}
+.btn:hover { background: #4a5ad1; transform: translateY(-2px); }
+.btn.primary { background: #1a1a2e; }
+.btn.primary:hover { background: #2e2e4a; }
+.btn.secondary { background: #e3e8f0; color: #1a1a2e; }
+.btn.secondary:hover { background: #d0d7e8; }
+
+.sample-preview {
+  margin-top: 1rem;
+  max-width: 100%;
+  max-height: 180px;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 2px dashed #dde3ec;
+}
+.sample-preview img {
+  max-width: 100%;
+  max-height: 180px;
+  object-fit: contain;
+  display: block;
+}
+
+.preview-wrap {
+  position: relative;
+  background: #fff;
+  border: 2px solid #dde3ec;
+  border-radius: 14px;
+  overflow: hidden;
+  min-height: 400px;
+}
+#previewCanvas {
+  width: 100%;
+  height: auto;
+  display: block;
+  background: #fffdf5; /* бумажный оттенок */
+}
+.sample-overlay {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  max-width: 200px;
+  max-height: 150px;
+  opacity: 0.35;
+  border-radius: 8px;
+  border: 1px solid #ccc;
+  pointer-events: none;
+}
+
+.controls label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin-bottom: 0.9rem;
+  font-size: 0.95rem;
+}
+.controls span {
+  font-weight: 600;
+  color: #333;
+}
+.controls input[type="range"],
+.controls select,
+.controls input[type="color"] {
+  width: 100%;
+  padding: 0.3rem;
+  border-radius: 6px;
+  border: 1px solid #dde3ec;
+  font-size: 1rem;
+}
+.controls output {
+  font-family: monospace;
+  font-weight: bold;
+  color: #6c7ae0;
+  align-self: flex-end;
+}
+
+.actions {
+  display: flex;
+  gap: 0.7rem;
+  flex-wrap: wrap;
+  margin-top: 1rem;
+}
+
+.hint {
+  margin-top: 1rem;
+  font-size: 0.9rem;
+  color: #777;
+  background: #f5f7fa;
+  padding: 0.75rem 1rem;
+  border-radius: 10px;
+}
+.hint code {
+  background: #e3e8f0;
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+  font-size: 0.85em;
+}
+
+.instructions {
+  background: #fff;
+  border-radius: 20px;
+  padding: 1.5rem;
+  box-shadow: 0 10px 30px rgba(26,26,46,0.08);
+}
+.instructions h2 {
+  font-size: 1.3rem;
+  margin-bottom: 0.75rem;
+  color: #1a1a2e;
+}
+.instructions ol {
+  margin-left: 1.2rem;
+}
+.instructions li {
+  margin-bottom: 0.5rem;
+  color: #444;
+}
+.instructions code {
+  background: #f0f2f8;
+  padding: 0.15rem 0.4rem;
+  border-radius: 4px;
+  font-size: 0.9em;
+  color: #2e2e4a;
+}
+
+.hidden { display: none !important; }
+
+@media (max-width: 600px) {
+  header h1 { font-size: 2rem; }
+  .actions { flex-direction: column; }
+  .btn { justify-content: center; }
+}

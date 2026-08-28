@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Почерк A1 — Плоттер для домашки</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Caveat:wght@400;700&family=Marck+Script&family=Lobster&family=Pacifico&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>✏️ Почерк A1</h1>
+      <p>Принтер Bambu Lab A1 с ручкой. Введи текст домашки — настрой вид — получи файл для печати.</p>
+    </header>
+
+    <main class="grid">
+      <section class="panel">
+        <h2>📝 Текст домашки</h2>
+        <textarea id="textInput" rows="6" placeholder="Напиши текст, который принтер должен написать ручкой...">Домашнее задание по русскому языку.
+Выполнил самостоятельно.</textarea>
+
+        <h2>📷 Образец почерка (по желанию)</h2>
+        <label class="upload-label">
+          <input type="file" id="sampleUpload" accept="image/*" hidden>
+          <span class="btn">📎 Загрузить фото почерка</span>
+        </label>
+        <div id="samplePreview" class="sample-preview hidden"></div>
+
+        <h2>🎨 Настройка почерка</h2>
+        <div class="controls">
+          <label>
+            <span>Шрифт</span>
+            <select id="fontSelect">
+              <option value="'Caveat', cursive">Caveat (рукописный)</option>
+              <option value="'Marck Script', cursive">Marck Script (русский)</option>
+              <option value="'Lobster', cursive">Lobster (красивый)</option>
+              <option value="'Pacifico', cursive">Pacifico (мягкий)</option>
+            </select>
+          </label>
+
+          <label>
+            <span>Наклон букв (°)</span>
+            <input type="range" id="tilt" min="-30" max="30" value="-5" step="1">
+            <output id="tiltVal">-5°</output>
+          </label>
+
+          <label>
+            <span>Размер букв (%)</span>
+            <input type="range" id="size" min="50" max="300" value="140" step="5">
+            <output id="sizeVal">140%</output>
+          </label>
+
+          <label>
+            <span>Расстояние букв</span>
+            <input type="range" id="spacing" min="0.5" max="3" value="1.1" step="0.1">
+            <output id="spacingVal">1.1</output>
+          </label>
+
+          <label>
+            <span>Межстрочный интервал</span>
+            <input type="range" id="lineHeight" min="1" max="3" value="1.5" step="0.1">
+            <output id="lineHeightVal">1.5</output>
+          </label>
+
+          <label>
+            <span>Толщина линии (px)</span>
+            <input type="range" id="stroke" min="0.5" max="5" value="2" step="0.5">
+            <output id="strokeVal">2px</output>
+          </label>
+
+          <label>
+            <span>Цвет чернил</span>
+            <input type="color" id="inkColor" value="#1a1a2e">
+          </label>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>👁️ Предпросмотр</h2>
+        <div class="preview-wrap" id="previewWrap">
+          <canvas id="previewCanvas" width="800" height="600"></canvas>
+          <img id="sampleOverlay" class="sample-overlay hidden" alt="Образец почерка">
+        </div>
+        <div class="actions">
+          <button class="btn primary" onclick="exportSVG()">⬇ Скачать SVG</button>
+          <button class="btn" onclick="exportGCode()">⬇ Скачать G-код</button>
+          <button class="btn secondary" onclick="printPage()">🖨 Печать / Экспорт</button>
+        </div>
+        <p class="hint">
+          💡 SVG — готовый файл для принтера или конвертации в G-код.<br>
+          G-код генерируется через Python-скрипт <code>convert_svg_to_gcode.py</code>.
+        </p>
+      </section>
+    </main>
+
+    <section class="instructions">
+      <h2>📋 Как использовать с Bambu Lab A1</h2>
+      <ol>
+        <li>Введи текст домашки в поле слева.</li>
+        <li>Настрой внешний вид с помощью ползунков (наклон, размер, расстояние, толщина).</li>
+        <li>По желанию загрузи фото своего почерка для сравнения.</li>
+        <li>Нажми «Скачать SVG» или «Скачать G-код».</li>
+        <li>Для G-кода: запусти <code>python3 convert_svg_to_gcode.py output.svg</code>.</li>
+        <li>Загрузи G-код в принтер с ручкой и печатай на бумаге.</li>
+      </ol>
+    </section>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>
