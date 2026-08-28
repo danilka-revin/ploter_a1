@@ -18,10 +18,12 @@ for name, url in FONTS:
         print(f"Скачиваю CSS для {name}...")
         with urllib.request.urlopen(url, timeout=15) as response:
             css = response.read().decode('utf-8')
-        # Извлекаем URL файлов шрифтов (.woff2)
-        woff_urls = re.findall(r"url\((https://[^)]+\.woff2)\)", css)
+        # Извлекаем URL файлов шрифтов (.woff2, .woff, .ttf)
+        woff_urls = re.findall(r"url\((https://[^)]+)\)", css)
+        # Фильтруем только те, что содержат font-файлы (woff2, woff, ttf)
+        font_urls = [w for w in woff_urls if any(ext in w for ext in ['.woff2', '.woff', '.ttf'])]
         files_downloaded = []
-        for wurl in woff_urls:
+        for wurl in font_urls:
             fname = wurl.split('/')[-1]
             local_path = os.path.join("fonts", fname)
             print(f"  Скачиваю {fname}...")

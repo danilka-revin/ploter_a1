@@ -33,7 +33,18 @@ case "${1:-start}" in
     echo "--- 1. Обновление из git ---"
     git pull origin arena/01a0484a-ploter-a1 || git pull origin main || echo "Git pull пропущен"
     echo "--- 2. Установка Python-зависимостей ---"
-    if [ -f requirements.txt ]; then pip install -r requirements.txt || echo "pip пропущен"; else echo "Нет requirements.txt"; fi
+    if [ -f requirements.txt ]; then
+      if [ ! -d "venv" ]; then
+        python3 -m venv venv || echo "venv не создан (возможно, нет python3-venv)"
+      fi
+      if [ -d "venv" ]; then
+        venv/bin/pip install -r requirements.txt || echo "pip пропущен"
+      else
+        pip install --break-system-packages -r requirements.txt || echo "pip пропущен"
+      fi
+    else
+      echo "Нет requirements.txt"
+    fi
     echo "--- 3. Скачивание шрифтов и зависимостей ---"
     python3 download_fonts.py || echo "Скачивание шрифтов пропущено"
     echo "--- 4. Генерация шаблонов (если их нет) ---"
