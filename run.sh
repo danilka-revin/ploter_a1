@@ -28,6 +28,24 @@ case "${1:-start}" in
       echo "Файл output.svg не найден. Сначала скачай SVG из приложения или создай его."
     fi
     ;;
+  all)
+    echo "=== ВСЁ ОДНОЙ КОМАНДОЙ ==="
+    echo "--- 1. Обновление из git ---"
+    git pull origin arena/01a0484a-ploter-a1 || git pull origin main || echo "Git pull пропущен"
+    echo "--- 2. Скачивание зависимостей (шрифты) ---"
+    python3 download_fonts.py || echo "Скачивание шрифтов пропущено (возможно, нет интернета)"
+    echo "--- 3. Построение G-кода ---"
+    for svg in *.svg; do
+      [ -e "$svg" ] || continue
+      output="${svg%.svg}.gcode"
+      python3 convert_svg_to_gcode.py "$svg" "$output" || true
+      echo "Построено: $output"
+    done
+    echo "--- 4. Запуск сервера ---"
+    echo "Открой в браузере: http://localhost:8080"
+    echo "Нажми Ctrl+C для остановки"
+    python3 -m http.server 8080 --bind 0.0.0.0
+    ;;
   build)
     echo "=== Построение G-кода ==="
     # Генерируем базовый SVG из текста в README или из последнего файла
