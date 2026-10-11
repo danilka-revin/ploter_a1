@@ -9,11 +9,14 @@ load_dotenv(BASE_DIR / ".env")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-# Расписание: страница класса 10 ИТ (лицей №6 «Перспектива»)
-SCHEDULE_PAGE_URL = os.getenv(
-    "SCHEDULE_PAGE_URL", "https://raspisanie.nikasoft.ru/22811554.html"
-)
-# Файл с ручным расписанием (запасной вариант, если автопарсинг не сработал)
+# Расписание: класс 10ит (лицей №6 «Перспектива», Красноярск)
+SCHOOL_ID = os.getenv("SCHOOL_ID", "22811554")
+CLASS_NAME = os.getenv("CLASS_NAME", "10ит")
+SCHEDULE_PAGE_URL = f"https://raspisanie.nikasoft.ru/{SCHOOL_ID}.html"
+# check-страница отдаёт имя актуального JS-файла с расписанием
+SCHEDULE_CHECK_URL = f"https://raspisanie.nikasoft.ru/check/{SCHOOL_ID}.html"
+SCHEDULE_STATIC_URL = "https://raspisanie.nikasoft.ru/static/public/"
+# Запасной файл с ручным расписанием (не попадает в Git)
 MANUAL_SCHEDULE_FILE = BASE_DIR / "data" / "schedule.txt"
 
 # Погода: Красноярск

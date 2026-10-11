@@ -1,123 +1,134 @@
-"""Расписание класса.
+"""Расписание класса: загрузка с raspisanie.nikasoft.ru и формирование текста.
 
-Сайт Ника-Софт строит страницу из JavaScript-файла с данными (вида 20261013_12345.js).
-Здесь:
-  1. скачиваем HTML страницы и ищем имя этого файла;
-  2. скачиваем файл и достаём из него JSON (после `var NIKA = `);
-  3. если автопарсинг не сработал, используем ручной файл data/schedule.txt.
-
-Сырой JSON сохраняется в data/debug/, чтобы можно было доработать разбор
-под реальную структуру данных (см. debug_schedule.py).
+Порядок:
+  1. check-страница класса -> имя актуального JS-файла (меняется при обновлении расписания);
+  2. JS-файл в static/public -> объект NIKA (см. schedule_parser.py);
+  3. если сайт недоступен - запасной файл data/schedule.txt.
 """
+from __future__ import annotations
+
 import json
 import logging
 import re
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from urllib.parse import urljoin
 
 import httpx
 
 import config
+from schedule_parser import (
+    DAY_NAMES,
+    NikaError,
+    NoScheduleForDate,
+    extract_nika_json,
+    find_class_id,
+    format_lessons,
+    lessons_for_date,
+)
 
 log = logging.getLogger(__name__)
 
-DAYS_RU = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+CACHE_SECONDS = 600
+_cache: dict = {"ts": 0.0, "data": None}
 
 
-class ScheduleError(Exception):
-    pass
+async def fetch_nika(client: httpx.AsyncClient) -> dict:
+    """Скачивает и разбирает расписание. Результат кэшируется на CACHE_SECONDS."""
+    if _cache["data"] is not None and time.time() - _cache["ts"] < CACHE_SECONDS:
+        return _cache["data"]
 
-
-async def fetch_raw_nika_data(client: httpx.AsyncClient) -> dict:
-    """Возвращает JSON-объект из JS-файла расписания."""
-    page = await client.get(config.SCHEDULE_PAGE_URL)
-    page.raise_for_status()
-    html = page.text
-
-    match = re.search(r"(\d+_\d+\.js)", html)
+    check = await client.get(config.SCHEDULE_CHECK_URL)
+    check.raise_for_status()
+    match = re.search(r"(\d+_\d+\.js)", check.text)
     if not match:
-        raise ScheduleError("В HTML страницы не найден JS-файл с данными расписания")
-    js_url = urljoin(config.SCHEDULE_PAGE_URL, match.group(1))
+        raise NikaError("На check-странице не найдено имя JS-файла")
 
+    js_url = urljoin(config.SCHEDULE_STATIC_URL, match.group(1))
     js = await client.get(js_url)
     js.raise_for_status()
-
-    m = re.search(r"var\s+NIKA\s*=\s*(\{.*\})\s*;?", js.text, re.DOTALL)
-    if not m:
-        raise ScheduleError("В JS-файле не найден объект NIKA")
-    data = json.loads(m.group(1))
+    data = extract_nika_json(js.text)
 
     config.DEBUG_DIR.mkdir(parents=True, exist_ok=True)
     (config.DEBUG_DIR / "nika_raw.json").write_text(
         json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    _cache.update(ts=time.time(), data=data)
     return data
 
 
-def parse_lessons_for_day(data: dict, weekday: int) -> list[str]:
-    """Разбор уроков на нужный день недели (0 = понедельник).
-
-    TODO: подогнать под реальную структуру NIKA (см. data/debug/nika_raw.json).
-    Пока возвращает пустой список, и бот использует ручной файл.
-    """
-    raise ScheduleError("Парсер структуры NIKA ещё не настроен")
-
-
-def read_manual_schedule() -> str | None:
-    """Ручное расписание из data/schedule.txt (блоки по дням недели)."""
+def _manual_schedule_text(now: datetime) -> str | None:
+    """Запасной вариант: блоки по дням недели из data/schedule.txt."""
     path = config.MANUAL_SCHEDULE_FILE
     if not path.exists():
         return None
     text = path.read_text(encoding="utf-8").strip()
-    return text or None
-
-
-def manual_day_text(weekday: int) -> str | None:
-    """Достаёт из schedule.txt блок нужного дня.
-
-    Формат файла: строка-заголовок дня (например, «Понедельник»), под ней уроки.
-    Блок заканчивается, когда начинается следующий день.
-    """
-    text = read_manual_schedule()
     if not text:
         return None
-    day_name = DAYS_RU[weekday].lower()
-    lines = text.splitlines()
+    day_name = DAY_NAMES[now.weekday()]
     out: list[str] = []
     capturing = False
-    for line in lines:
+    for line in text.splitlines():
         stripped = line.strip()
         head = stripped.rstrip(":").lower()
-        if head in [d.lower() for d in DAYS_RU]:
+        if head in DAY_NAMES:
             if capturing:
                 break
             capturing = head == day_name
             continue
-        if capturing and stripped:
+        if capturing and stripped and not stripped.startswith("#"):
             out.append(stripped)
     return "\n".join(out) if out else None
 
 
+def _format_day(data: dict, class_name: str, day: datetime, offset: int) -> str:
+    class_id = find_class_id(data, class_name)
+    lessons = lessons_for_date(data, class_id, day.date())
+    weekday = DAY_NAMES[day.weekday()]
+    date_text = day.strftime("%d.%m.%Y")
+
+    if offset == 0:
+        head = f"📚 Расписание {class_name}, {weekday}, {date_text}"
+    elif offset == 1:
+        head = f"📚 Расписание {class_name} на завтра — {weekday}, {date_text}"
+    else:
+        head = f"📚 Ближайшие занятия {class_name} — {weekday}, {date_text}"
+
+    body = "\n".join(format_lessons(data, lessons))
+    notes = []
+    if any(lesson.changed for lesson in lessons):
+        notes.append("🔄 — урок изменён заменой на эту дату")
+    return "\n\n".join(p for p in (head, body, "\n".join(notes)) if p)
+
+
 async def get_today_schedule(client: httpx.AsyncClient, now: datetime) -> str:
-    """Расписание на сегодня: сначала пробуем сайт, затем ручной файл."""
-    weekday = now.weekday()
-    header = f"📚 Расписание 10 ИТ, {DAYS_RU[weekday]}, {now:%d.%m.%Y}"
-    if weekday == 6:
-        return f"{header}\n\nВоскресенье — выходной 🎉"
+    """Текст расписания на сегодня. Если сегодня занятий нет - ближайший учебный день."""
+    try:
+        data = await fetch_nika(client)
+    except (httpx.HTTPError, NikaError, ValueError) as e:
+        log.warning("Не удалось загрузить расписание с сайта: %s", e)
+        manual = _manual_schedule_text(now)
+        if manual:
+            return f"📚 Расписание {config.CLASS_NAME}, {DAY_NAMES[now.weekday()]} "\
+                   f"(из запасного файла)\n\n{manual}"
+        return (
+            f"⚠️ Не удалось получить расписание с сайта ({e}).\n"
+            "Можно заполнить school_bot/data/schedule.txt вручную."
+        )
 
     try:
-        data = await fetch_raw_nika_data(client)
-        lessons = parse_lessons_for_day(data, weekday)
-        if lessons:
-            return header + "\n\n" + "\n".join(lessons)
-    except (ScheduleError, httpx.HTTPError, json.JSONDecodeError) as e:
-        log.warning("Автопарсинг расписания не сработал: %s", e)
-
-    manual = manual_day_text(weekday)
-    if manual:
-        return header + "\n\n" + manual
-    return (
-        header
-        + "\n\nРасписание не удалось получить. Добавьте его в файл "
-        "school_bot/data/schedule.txt (см. README)."
-    )
+        class_id = find_class_id(data, config.CLASS_NAME)
+        for offset in range(0, 8):
+            day = now + timedelta(days=offset)
+            if lessons_for_date(data, class_id, day.date()):
+                text = _format_day(data, config.CLASS_NAME, day, offset)
+                if offset > 0:
+                    text = (
+                        f"Сегодня — {DAY_NAMES[now.weekday()]}, занятий нет.\n\n" + text
+                    )
+                return text
+        return f"Занятий на ближайшие дни нет ({config.CLASS_NAME})."
+    except NoScheduleForDate as e:
+        return f"📚 Расписание {config.CLASS_NAME}: {e}."
+    except NikaError as e:
+        return f"⚠️ Ошибка разбора расписания: {e}"
