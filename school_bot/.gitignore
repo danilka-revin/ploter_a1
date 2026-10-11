@@ -1,0 +1,6 @@
+.env
+.venv/
+__pycache__/
+data/schedule.txt
+data/subscribers.json
+data/debug/
