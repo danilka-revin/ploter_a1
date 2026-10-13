@@ -33,6 +33,7 @@ export interface CellStats {
   avg: number;
   minIndex: number;
   maxIndex: number;
+  sum?: number;
 }
 
 export interface Snapshot {
@@ -49,7 +50,7 @@ export interface SettingItem {
   key: string;
   label: string;
   unit: string;
-  value: number | null;
+  value: number | string | null;
   error?: string;
   /** можно менять из приложения */
   editable?: boolean;
@@ -57,6 +58,14 @@ export interface SettingItem {
   min?: number;
   max?: number;
   step?: number;
+  /** адрес регистра, напр. 0x24 */
+  reg?: string;
+  /** поле занимает один байт регистра */
+  byte?: 'hi' | 'lo' | null;
+  /** запись меняет поведение платы (аппаратные защиты, маски, калибровка) */
+  risky?: boolean;
+  /** побитовые поля (маски функций) */
+  bits?: { mask: number; key: string; label: string }[] | null;
 }
 
 export interface SettingsResponse {
@@ -165,4 +174,206 @@ export interface ScanResponse {
   at: number;
   results: ScanResult[];
   found: string[];
+}
+
+// ---------- панель: банками управляет сервер (scripts/banks.mjs) ----------
+
+export interface SparkPoint { t: number; soc: number | null; v: number | null; a: number | null; delta: number | null }
+
+export interface BankRow {
+  id: string;
+  label: string;
+  path: string;
+  demo: boolean;
+  connected: boolean;
+  at: number;
+  lastError: string;
+  failures: number;
+  deviceName: string;
+  model: string;
+  cellCount: number;
+  profile?: string;
+  voltage: number | null;
+  current: number | null;
+  power: number | null;
+  remainingAh: number | null;
+  fullAh: number | null;
+  soc: number | null;
+  cycles: number | null;
+  cells: number[];
+  stats: CellStats | null;
+  temperatures: number[];
+  chargeFetOn: boolean | null;
+  dischargeFetOn: boolean | null;
+  balancingCells: number[];
+  faults: { key: string; label: string }[];
+  faultRaw: number;
+  errors: Record<string, number> | null;
+  hwVersion: string;
+  swVersion: string;
+  serial: string;
+  prodDate: string;
+  firmwareVersion: number | null;
+  spark: SparkPoint[];
+}
+
+export interface Fleet {
+  banks: number;
+  online: number;
+  stale: number;
+  voltageAvg: number | null;
+  currentSum: number | null;
+  powerSum: number | null;
+  powerMax: number | null;
+  socAvg: number | null;
+  ahSum: number | null;
+  ahCapacity: number | null;
+  cellMin: number | null;
+  cellMax: number | null;
+  cellDelta: number | null;
+  tempMax: number | null;
+  faults: number;
+  balancing: number;
+  cyclesMax: number | null;
+  chargeFetOff: number;
+  dischargeFetOff: number;
+}
+
+/** Ряды для графиков: null — пропуск (плата молчала в этот момент). */
+export interface Series {
+  t: number[];
+  v: (number | null)[];
+  a: (number | null)[];
+  w: (number | null)[];
+  soc: (number | null)[];
+  rem: (number | null)[];
+  delta: (number | null)[];
+  min: (number | null)[];
+  max: (number | null)[];
+  bal: (number | null)[];
+  faults: (number | null)[];
+  temps: (number | null)[][];
+  step: number;
+  samples: number;
+}
+
+export interface Panel {
+  at: number;
+  pollMs: number;
+  lastPollAt: number;
+  banks: BankRow[];
+  fleet: Fleet;
+  focus: string | null;
+  series: Series | null;
+  fleetSeries: Series | null;
+}
+
+export interface CatalogBit { mask: number; key: string; label: string }
+
+export interface CatalogSetting {
+  key: string;
+  label: string;
+  unit: string;
+  reg: number;
+  hex: string;
+  kind: string;
+  byte: 'hi' | 'lo' | null;
+  group: string;
+  editable: boolean;
+  risky: boolean;
+  min: number | null;
+  max: number | null;
+  step: number | null;
+  bits: CatalogBit[] | null;
+}
+
+export interface CatalogReg { reg: number; label: string; access: 'r' | 'w' | 'rw'; group: string; note?: string; risky?: boolean }
+
+export interface CatalogControl {
+  key: string;
+  reg: number | null;
+  label: string;
+  save: boolean;
+  verified: boolean;
+  note: string;
+  risky?: boolean;
+}
+
+export interface Catalog {
+  settings: CatalogSetting[];
+  info: { key: string; reg: number; label: string; kind: string; group: string; unit?: string; hex?: string }[];
+  control: CatalogControl[];
+  regs: CatalogReg[];
+  faults: { bit: number; key: string; label: string }[];
+  errorCounters: { key: string; label: string }[];
+  writable: string[];
+}
+
+export interface BankRegisters {
+  at: number;
+  id: string;
+  label: string;
+  port: string;
+  info: Record<string, string | number | null>;
+  infoAt: number;
+  deviceName: string;
+  basic: Basic | null;
+  cells: { values: number[]; stats: CellStats | null } | null;
+  errors: Record<string, number> | null;
+  settings: SettingItem[];
+}
+
+export interface RawRegItem {
+  reg: number;
+  hex: string;
+  ok: boolean;
+  bytes: string[];
+  text: string;
+  u16: number | null;
+  temp: number | null;
+  error: string;
+  length?: number;
+}
+
+export interface RawReadResponse { at: number; id: string; items: RawRegItem[] }
+
+export interface RawWriteResponse {
+  ok: boolean;
+  reg: number;
+  hex: string;
+  sent: number[];
+  read: { bytes: string[]; u16: number | null } | null;
+  message: string;
+}
+
+export interface ControlResult {
+  id: string;
+  label: string;
+  ok?: boolean;
+  message?: string;
+  chargeFetOn?: boolean;
+  dischargeFetOn?: boolean;
+  balance?: boolean;
+  remainingAh?: number;
+  fullAh?: number;
+  errors?: Record<string, number>;
+}
+
+export interface ControlResponse { action: string; results: ControlResult[]; ok: boolean }
+
+export interface ReportBank extends BankRow {
+  info: Record<string, string | number | null> | null;
+  infoAt: number;
+  settings: SettingItem[] | null;
+}
+
+export interface Report {
+  at: number;
+  app: string;
+  fleet: Fleet;
+  banks: ReportBank[];
+}
+
+export interface PortsResponseExtended extends PortsResponse {
+  ports: (PortItem & { used?: boolean })[];
 }

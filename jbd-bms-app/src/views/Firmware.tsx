@@ -1,12 +1,15 @@
 // Прошивка: текущая версия с платы, проверка файла .hex и (пока заблокированная) запись.
 import { useRef, useState } from 'react';
 import { api, fmtBytes } from '../api';
-import type { FirmwareInfo, Snapshot } from '../types';
+import type { FirmwareInfo } from '../types';
 import { Icon } from '../icons';
 
-export function Firmware({ connected, snap, onStateChange, initialInfo = null }: {
+export function Firmware({ connected, version = '—', deviceName = '', cellCount = null, onStateChange, initialInfo = null }: {
   connected: boolean;
-  snap: Snapshot | null;
+  /** версия прошивки из регистра 0x03 (или «—») */
+  version?: string | null;
+  deviceName?: string;
+  cellCount?: number | null;
   onStateChange: () => void;
   /** для тестов рендера: результат проверки файла без загрузки */
   initialInfo?: FirmwareInfo | null;
@@ -16,8 +19,6 @@ export function Firmware({ connected, snap, onStateChange, initialInfo = null }:
   const [busy, setBusy] = useState(false);
   const [flashMsg, setFlashMsg] = useState('');
   const fileRef = useRef<HTMLInputElement>(null);
-
-  const version = snap ? `0x${snap.basic.firmwareVersion.toString(16).toUpperCase().padStart(2, '0')}` : '—';
 
   const onPick = async (file: File | undefined) => {
     if (!file) return;
@@ -58,9 +59,9 @@ export function Firmware({ connected, snap, onStateChange, initialInfo = null }:
         <h3>Текущая прошивка</h3>
         {!connected && <p className="muted small">Подключите BMS, чтобы увидеть версию.</p>}
         <ul className="kv">
-          <li><span>Версия (регистр 0x03)</span><b>{connected ? version : '—'}</b></li>
-          <li><span>Имя устройства</span><b>{snap?.deviceName || '—'}</b></li>
-          <li><span>Ячеек</span><b>{snap ? snap.basic.cellCount : '—'}</b></li>
+          <li><span>Версия (регистр 0x03)</span><b>{connected ? (version || '—') : '—'}</b></li>
+          <li><span>Имя устройства</span><b>{deviceName || '—'}</b></li>
+          <li><span>Ячеек</span><b>{cellCount ?? '—'}</b></li>
         </ul>
       </section>
 

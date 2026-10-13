@@ -1,6 +1,5 @@
-// Рендер экранов интерфейса на данных нужной формы (без браузера):
-// проверяем, что экраны не падают и показывают важные тексты.
-// Сборка через esbuild, который уже стоит вместе с Vite.
+// Рендер плиток панели на данных нужной формы (SSR, без браузера): проверяем,
+// что плитки не падают и показывают главные числа, графики и точки записи.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -13,7 +12,7 @@ const root = join(here, '..');
 const outDir = join(root, 'node_modules', '.cache');
 const outFile = join(outDir, 'ui-render.mjs');
 
-test('экраны рендерятся на данных плате и показывают ключевые сведения', async (t) => {
+test('плитки панели рендерятся и показывают ключевые сведения', async (t) => {
   if (!existsSync(join(root, 'node_modules', 'esbuild'))) { t.skip('esbuild не установлен'); return; }
   mkdirSync(outDir, { recursive: true });
   const entry = join(here, 'ui-render.entry.tsx');
@@ -23,112 +22,123 @@ test('экраны рендерятся на данных плате и пока
   ], { cwd: root, stdio: 'inherit' });
   const m = await import(pathToFileURL(outFile).href);
 
-  const cellsText = m.renderCells();
-  assert.match(cellsText, /3\.315/);
-  assert.match(cellsText, /Разброс:/);
-  assert.match(cellsText, /15 мВ/);
-  assert.match(cellsText, /баланс/);
-  assert.equal((cellsText.match(/<tr/g) || []).length, 5, '4 ячейки + заголовок');
+  // отчёт по всем банкам: онлайн и офлайн строки, числа, мини-график
+  const report = m.renderBanks();
+  assert.match(report, /BANK A/);
+  assert.match(report, /BANK B/);
+  assert.match(report, /39,71/);
+  assert.match(report, /-29,90/);
+  assert.match(report, /нет связи/);
+  assert.match(report, /is-focus/, 'выбранный банк подсвечен');
+  assert.match(report, /is-off/, 'банк без связи помечен');
+  assert.match(report, /Перенапряжение ячейки/, 'активная защита видна в отчёте');
+  assert.match(report, /class="spark/, 'в строке есть мини-график');
+  assert.equal((report.match(/<tr/g) || []).length, 3, '2 банка + заголовок');
 
-  const ctl = m.renderControl();
-  assert.match(ctl, /Остаток ёмкости/);
-  assert.match(ctl, /Сбросить счётчики/);
-  assert.match(ctl, /Резервная копия настроек/);
-  assert.match(ctl, /Не делается в приложении/);
-  assert.doesNotMatch(ctl, /Выключить заряд/, 'ключи теперь на схеме, а не в управлении');
+  assert.match(m.renderBanksEmpty(), /Банков пока нет/);
+  assert.match(m.renderBanksEmpty(), /Найти и подключить все/);
 
-  // блок «Заряд и разряд»: схема и большие кнопки
-  const pw = m.renderPower();
-  assert.match(pw, /ЗАРЯД/);
-  assert.match(pw, /РАЗРЯД/);
-  assert.match(pw, /ВКЛЮЧЕН/);
-  assert.match(pw, /Нажмите, чтобы ВЫКЛЮЧИТЬ/);
-  assert.match(pw, /ключ заряда/);
-  assert.match(pw, /ключ разряда/);
-  assert.match(pw, /АККУМУЛЯТОР/);
-  assert.match(pw, /13\.27 В/);
-  assert.match(pw, /ПЛАТА BMS/);
-  assert.equal((pw.match(/class="sc-cell/g) || []).length, 4, 'по одной полоске на ячейку');
-  assert.match(pw, /aria-label="Схема:/);
+  // ключевые числа: банк и парк
+  const kpi = m.renderKpis();
+  assert.match(kpi, /Напряжение/);
+  assert.match(kpi, /39,71/);
+  assert.match(kpi, /Разброс ячеек/);
+  assert.match(kpi, /21/);
+  assert.match(kpi, /gauge/, 'есть шкала остатка заряда');
+  assert.match(m.renderKpisFleet(), /весь парк|Активных защит/);
 
-  const pwOff = m.renderPowerDischargeOff();
-  assert.match(pwOff, /РАЗРЯД/);
-  assert.match(pwOff, /ВЫКЛЮЧЕН/);
-  assert.match(pwOff, /Нажмите, чтобы ВКЛЮЧИТЬ/);
-  assert.match(pwOff, /порт \/dev\/ttyUSB0/, 'схема показывает выбранный порт');
+  // графики: линии, пороги, полоски ячеек
+  const charts = m.renderCharts();
+  assert.match(charts, /Напряжение · ток/);
+  assert.match(charts, /Мощность/);
+  assert.match(charts, /Температуры/);
+  assert.match(charts, /Разброс ячеек · остаток заряда/);
+  assert.match(charts, /<path/, 'график построен линиями');
+  assert.equal((charts.match(/class="cb-col/g) || []).length, 12, 'по одной полоске на ячейку');
+  assert.match(charts, /cb-col is-bal/, 'балансируемая ячейка подсвечена');
+  assert.match(charts, /Хронология опросов/);
+  assert.match(m.renderChartsNoData(), /Графики появятся через минуту/);
 
-  const pwOffline = m.renderPowerDisconnected();
-  assert.match(pwOffline, /подключите плату/);
-  assert.match(pwOffline, /нет данных/);
-  assert.match(pwOffline, /class="power-btn[^"]*" disabled=""/, 'кнопки выключены без платы');
+  // вкладка данных: всё, что читается с платы
+  const data = m.renderDataBody();
+  assert.match(data, /Напряжение сборки/);
+  assert.match(data, /39,71 В/);
+  assert.match(data, /Ключ заряда/);
+  assert.match(data, /включён/);
+  assert.match(data, /Короткое замыкание/);
+  assert.match(data, /SW 4\.21-LFP/);
+  assert.match(data, /0x17.05.2024|17\.05\.2024/);
+  assert.match(data, /Счётчики срабатываний/);
+  assert.match(data, /0x24|Перенапр/, 'битовые защиты и счётчики показаны');
 
-  const overview = m.renderOverview();
-  assert.match(overview, /13\.27/);
-  assert.match(overview, /разряд/);
-  assert.match(overview, /Защиты/);
-  assert.match(overview, /защит нет/);
-  assert.match(overview, /Балансируются ячейки: 3/);
-  assert.match(overview, /Датчик 1/);
+  // вкладка записи: все регистры EEPROM, метки риска и байтовых полей
+  const set = m.renderSettingsBody();
+  assert.match(set, /Перенапряжение ячейки \(OVP\)/);
+  assert.match(set, /3650/);
+  assert.match(set, /0x24/);
+  assert.match(set, /Таблица SOC/);
+  assert.match(set, /старший байт/, 'байтовое поле подписано');
+  assert.match(set, />риск</, 'рискованные регистры помечены');
+  assert.match(set, /Балансировка разрешена/, 'маска показана битами');
+  assert.match(set, /disabled=""[^>]*>Записать/, 'без изменений кнопка записи выключена');
+  assert.doesNotMatch(set, /value="3600"/, 'поле показывает значение платы, а не выдумку');
 
-  const faulty = m.renderOverviewWithFault();
-  assert.match(faulty, /Перенапряжение ячейки/);
-  assert.match(faulty, /активно: 1/);
+  const tile = m.renderDataTile();
+  assert.match(tile, /Все данные платы/);
+  assert.match(tile, /Защита и настройки/);
+  assert.match(tile, /Прошивка/);
+  assert.match(m.renderDataEmpty(), /Банк не выбран|Читаю регистры/);
 
-  const fw = m.renderFirmwareWithFile();
+  // управление
+  const ops = m.renderControl();
+  assert.match(ops, /заряд включён/);
+  assert.match(ops, /разряд выключен/);
+  assert.match(ops, /Балансировка/);
+  assert.match(ops, /Сбросить счётчики защит/);
+  assert.match(ops, /остаток ёмкости, Ач/);
+  assert.match(ops, /Копия настроек/);
+  assert.match(ops, /Пересчитать SOC/);
+  assert.match(ops, /всем банкам/, 'есть режим «команда всем банкам»');
+  assert.match(m.renderControlDisconnected(), /банк не выбран|цель: BANK B/);
+
+  // консоль регистров
+  const con = m.renderConsole();
+  assert.match(con, /Читать выбранное/);
+  assert.match(con, /0x03/);
+  assert.match(con, /Счётчики|0xAA/);
+  assert.match(con, /Записать в банк/);
+  assert.match(con, /заводской режим/);
+
+  // подключение и журнал
+  const connect = m.renderConnect();
+  assert.match(connect, /\/dev\/ttyUSB0/);
+  assert.match(connect, /занят банком/);
+  assert.match(connect, /Найти и подключить все/);
+  assert.match(connect, /Демо-банки/);
+  assert.match(connect, /в отчёте 2 банка/);
+  const jr = m.renderJournal();
+  assert.match(jr, /Записано 2 рег\./);
+  assert.match(jr, /связь потеряна/);
+
+  // прошивка и обновления
+  const fw = m.renderFirmware();
   assert.match(fw, /Запись отключена/);
   assert.match(fw, /Ошибки файла/);
   assert.match(fw, /неверная контрольная сумма/);
-
+  assert.match(fw, /0x10/);
   const upd = m.renderUpdate();
-  assert.match(upd, /Обновить с main/);
   assert.match(upd, /Сборка программы/);
   assert.match(upd, /Доступна новая версия/);
 
-  const set = m.renderSettingsIdle();
-  assert.match(set, /Прочитать настройки/);
-  assert.match(set, /Записать в плату/);
-  assert.match(m.renderSettingsDisconnected(), /Плата не подключена/);
-  const withData = m.renderSettingsWithData();
-  assert.match(withData, /Перенапряжение ячейки \(OVP\)/);
-  assert.match(withData, /Напряжение ячейки/);
-  assert.match(withData, /3,650 В/);
-  assert.match(withData, /40,0 А/);
-  assert.match(withData, /только чтение/);
-  assert.match(withData, /set-num/);
-  assert.match(withData, /disabled=""[^>]*>Записать в плату/, 'кнопка записи выключена без изменений');
-
-  const empty = m.renderOverviewDisconnected();
-  assert.match(empty, /Плата не подключена/);
-
-  // поиск батареи: карточка показывает найденную батарею и причины по остальным портам
-  const scan = m.renderConnectionScan();
-  assert.match(scan, /Найти батарею/);
-  assert.match(scan, /Найдено батарей: 1/);
-  assert.match(scan, /батарея отвечает: 12 ячеек, DEMO JBD 12S/);
-  assert.match(scan, /порт занят или нет доступа/);
-  assert.match(scan, />Подключить</);
-  assert.match(scan, /Как понять, к какому порту подключена батарея/);
-
-  const noAdapter = m.renderConnectionEmpty();
-  assert.match(noAdapter, /Адаптер не найден/);
-  assert.match(m.renderPortHelp(), /Найти батарею/);
-  assert.match(m.renderPortHelp(), /dmesg/);
-
-  // одна страница: ни одной вкладки, все блоки на месте
-  const page = m.renderPage();
-  assert.doesNotMatch(page, /role="tab"/);
-  assert.match(page, /1\. Подключение к батарее/);
-  assert.match(page, /2\. Заряд и разряд/);
-  assert.match(page, /3\. Состояние батареи/);
-  assert.match(page, /4\. Ячейки/);
-  assert.match(page, /5\. Управление/);
-  assert.match(page, /6\. Защиты и настройки платы/);
-  assert.match(page, /7\. Прошивка/);
-
-  // выбор порта: настоящий адаптер вытесняет демо, если пользователь сам его не выбирал
-  assert.equal(m.pick('demo', ['/dev/ttyUSB0'], false), '/dev/ttyUSB0', 'демо не залипает');
-  assert.equal(m.pick('demo', ['/dev/ttyUSB0'], true), 'demo', 'явный выбор демо сохраняется');
-  assert.equal(m.pick('/dev/ttyUSB1', ['/dev/ttyUSB0', '/dev/ttyUSB1'], true), '/dev/ttyUSB1', 'выбранный порт остаётся');
-  assert.equal(m.pick('/dev/ttyUSB1', ['/dev/ttyUSB0'], true), '/dev/ttyUSB0', 'пропавший порт заменяется первым');
-  assert.equal(m.pick('/dev/ttyUSB0', [], false), 'demo', 'портов нет — демо');
+  // вся панель: одна сетка, без вкладок-«сайта» и без схем
+  const app = m.renderApp();
+  assert.doesNotMatch(app, /role="tab"/, 'никаких вкладок-страниц');
+  assert.match(app, /Отчёт по всем банкам/);
+  assert.match(app, /Графики/);
+  assert.match(app, /Плата: все данные и настройки/);
+  assert.match(app, /Управление/);
+  assert.match(app, /Консоль регистров/);
+  assert.match(app, /data-density|data-area="bar"/);
+  assert.doesNotMatch(app, /sc-box|sc-flow|АККУМУЛЯТОР/, 'схемы убраны: только данные и управление');
+  assert.match(app, /Отчётом|CSV отчёт|CSV/);
 });

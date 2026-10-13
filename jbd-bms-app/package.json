@@ -14,7 +14,8 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "start": "node scripts/server.mjs",
-    "test": "node --test test/protocol.test.mjs test/intel-hex.test.mjs test/bms-client.test.mjs test/updater.test.mjs test/settings-write.test.mjs test/control.test.mjs test/ui-render.test.mjs test/serial.integration.test.mjs test/port-scan.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "test:fast": "node --test test/protocol.test.mjs test/protocol-extra.test.mjs test/banks.test.mjs"
   },
   "dependencies": {
     "react": "^18.3.1",

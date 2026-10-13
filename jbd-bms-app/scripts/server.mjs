@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Локальный сервер JBD BMS: отдаёт интерфейс и API к плате по UART.
+// Локальный сервер JBD BMS: отдаёт панель и API к платам по UART.
 //
 //   node scripts/server.mjs [порт]
 //   node scripts/server.mjs --update-now   — проверить GitHub и обновиться (для run.sh)
@@ -8,39 +8,50 @@
 // компьютеру, наружу её открывать не нужно. Переменные окружения:
 //   BMS_APP_HOST  — адрес (по умолчанию 127.0.0.1)
 //   BMS_APP_PORT  — порт (по умолчанию 8585)
+//   BMS_POLL_MS   — период опроса плат (по умолчанию 1000 мс)
 //
-// API:
-//   GET  /healthz            — жив ли сервер и его версия
-//   GET  /api/ports          — последовательные порты (и пункт «demo» — без платы)
-//   POST /api/scan           — найти батарею: опросить все порты и вернуть, где ответила плата
-//   POST /api/connect        — { path } открыть порт и проверить связь с BMS
-//   POST /api/disconnect     — закрыть порт
-//   GET  /api/snapshot       — состояние батареи, ячейки, счётчики ошибок
-//   GET  /api/settings       — пороги защит и настройки (чтение регистров 0x10–0x3F)
-//   POST /api/firmware/inspect — проверка файла .hex (тело запроса — текст файла)
-//   POST /api/firmware/flash   — запись прошивки (сейчас отказывает, см. firmware.mjs)
-//   GET  /update/check       — есть ли новый коммит на GitHub
-//   POST /update/run         — установить обновление
-//   GET  /update/status      — ход обновления
+// API (основное):
+//   GET  /api/panel?focus=<id>&window=600 — вся панель одним запросом: строки банков,
+//                                            итоги по парку, ряды для графиков
+//   GET  /api/banks                       — список банков (строки отчёта)
+//   POST /api/banks/add {path,label}      — подключить банк на порту
+//   POST /api/banks/demo {count}          — подключить демо-банки без платы
+//   POST /api/banks/auto                  — найти батареи на всех портах и подключить каждую
+//   POST /api/banks/remove {id}           — отключить банк
+//   POST /api/banks/rename {id,label}     — подпись банка в отчёте
+//   POST /api/banks/reconnect {id}        — перезайти на порт
+//   GET  /api/bank/registers?id=          — все регистры банка: паспорт + настройки + ошибки
+//   GET  /api/bank/settings?id=           — только пороги защит и EEPROM-настройки
+//   POST /api/bank/settings/write         — {id, changes, confirm, password, save, risk}
+//   POST /api/bank/control {id,action,…}  — ключи, остаток, балансировка, сбросы (id=all — всем)
+//   POST /api/bank/raw/read {id,regs}     — сырое чтение любых регистров (консоль)
+//   POST /api/bank/raw/write {id,reg,…}   — сырая запись регистра (консоль, с подтверждением)
+//   GET  /api/report[?id=]                — полный отчёт по всем банкам (JSON)
+//   GET  /api/report.csv                  — тот же отчёт в CSV (для Excel/Sheets)
+//   GET  /api/history?id=&seconds=        — история выборок банка для графиков
+//   GET  /api/catalog                     — описания регистров, настроек и команд
+//   POST /api/poll {ms}                    — задать период опроса
+//
+// Старые одиночные адреса сохранены: /api/connect, /api/disconnect, /api/state,
+// /api/snapshot, /api/settings, /api/settings/write, /api/control/*, /api/backup*,
+// /api/firmware/*, /api/ports, /api/scan, /update/*. Они работают с первым банком.
 //
 // Код выхода 10 означает «перезапустите меня» (его обрабатывает run.sh).
 
 import { createServer } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
-import { extname, join, normalize, resolve, dirname } from 'node:path';
+import { extname, join, normalize, resolve, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 
-import { BmsClient } from './bms-client.mjs';
+import { BankManager, cellStats } from './banks.mjs';
 import {
-  SETTINGS, WRITE_LIMITS, writableDefs, checkSettingValue, checkSettingsConsistency,
-  settingToRaw, passwordBytes, decodeSetting,
-  CTRL_REG, fetRaw, capRemRaw,
+  SETTINGS, WRITE_LIMITS, INFO_REGS, CONTROL_CMDS, REG_CATALOG, FAULT_BITS, REG, writableDefs,
+  ERROR_COUNTER_NAMES,
 } from './jbd-protocol.mjs';
 import { listSerialPorts, openSerialTransport } from './serial-transport.mjs';
 import { scanBmsPorts } from './port-scan.mjs';
-import { createFakeTransport } from './fake-bms.mjs';
 import { inspectFirmwareFile, flashFirmware, FirmwareError } from './firmware.mjs';
 import { createUpdater, RESTART_EXIT_CODE } from './updater.mjs';
 import { parseIntelHex } from './intel-hex.mjs';
@@ -61,74 +72,16 @@ function gitShortSha() {
   }
 }
 
-/** Состояние подключения к одной плате. */
-const session = {
-  transport: null,
-  client: null,
-  port: null,
-  demo: false,
-  deviceName: '',
-  lastError: '',
-  failures: 0,
-  firmwareText: null,
-  firmwareName: '',
-};
+// ---------- банки (платы) ----------
 
-const updater = createUpdater({ appDir: APP_DIR, log: (m) => console.log('автообновление: ' + m) });
+export const banks = new BankManager({
+  pollMs: Number(process.env.BMS_POLL_MS || 1000),
+  openTransport: openSerialTransport,
+  log: (m) => console.log('банк: ' + m),
+});
+banks.start();
 
-// ---------- подключение ----------
-
-async function disconnect() {
-  const c = session.client;
-  const t = session.transport;
-  session.client = null;
-  session.transport = null;
-  session.port = null;
-  session.demo = false;
-  session.deviceName = '';
-  session.failures = 0;
-  try { if (c) await c.close(); else if (t) await t.close(); } catch { /* порт уже закрыт */ }
-}
-
-async function connect(path) {
-  await disconnect();
-  let transport;
-  if (path === 'demo') {
-    transport = createFakeTransport({ cellCount: 12, name: 'DEMO JBD 12S' });
-  } else {
-    transport = await openSerialTransport(path);
-  }
-  const client = new BmsClient(transport, { timeoutMs: 800, retries: 2 });
-  try {
-    const basic = await client.readBasicInfo();
-    let name = '';
-    try { name = await client.readDeviceName(); } catch { /* не у всех прошивок есть имя */ }
-    session.transport = transport;
-    session.client = client;
-    session.port = path;
-    session.demo = path === 'demo';
-    session.deviceName = name;
-    session.lastError = '';
-    session.failures = 0;
-    return { basic, deviceName: name };
-  } catch (e) {
-    await client.close().catch(() => {});
-    throw e;
-  }
-}
-
-/** Опрос всех портов: где отвечает BMS. Пока плата подключена, порты не трогаем. */
-async function scanApi() {
-  if (session.client) throw httpError(409, 'CONNECTED', 'Плата уже подключена. Сначала нажмите «Отключить», затем ищите батарею.');
-  const ports = await listSerialPorts();
-  const results = await scanBmsPorts(ports);
-  return { at: Date.now(), results, found: results.filter((r) => r.found).map((r) => r.path) };
-}
-
-function requireClient() {
-  if (!session.client) throw httpError(409, 'NOT_CONNECTED', 'Плата не подключена.');
-  return session.client;
-}
+const firmware = { text: null, name: '' };
 
 function httpError(status, code, message) {
   const e = new Error(message);
@@ -137,268 +90,33 @@ function httpError(status, code, message) {
   return e;
 }
 
-// ---------- данные ----------
-
-function cellStats(cells) {
-  if (!cells.length) return null;
-  let min = Infinity, max = -Infinity, sum = 0, minIndex = 0, maxIndex = 0;
-  cells.forEach((v, i) => {
-    sum += v;
-    if (v < min) { min = v; minIndex = i; }
-    if (v > max) { max = v; maxIndex = i; }
-  });
-  return { min, max, delta: max - min, avg: Math.round(sum / cells.length), minIndex, maxIndex };
+/** Первый банк — адресам старого формата нужен именно он. */
+function primaryId() {
+  const first = banks.list()[0];
+  if (!first) throw httpError(409, 'NOT_CONNECTED', 'Плата не подключена.');
+  return first.id;
 }
 
-async function snapshot() {
-  const client = requireClient();
-  const basic = await client.readBasicInfo();
-  const cells = await client.readCellInfo();
-  let errors = null;
-  try { errors = await client.readErrorCounters(); } catch { /* не у всех прошивок */ }
-  session.failures = 0;
+/** Ответ в формате старого /api/snapshot (одна плата). */
+function legacySnapshot(bank) {
+  if (!bank.basic) throw httpError(502, 'READ_FAILED', 'Плата ещё не ответила на опрос.');
   return {
-    at: Date.now(),
-    port: session.port,
-    demo: session.demo,
-    deviceName: session.deviceName,
-    basic,
-    cells: { values: cells, stats: cellStats(cells) },
-    errors,
+    at: bank.at,
+    port: bank.path,
+    demo: bank.demo,
+    deviceName: bank.deviceName,
+    basic: bank.basic,
+    cells: { values: bank.cells?.values ?? [], stats: cellStats(bank.cells?.values ?? []) },
+    errors: bank.errors,
   };
 }
 
-async function readSettings() {
-  const client = requireClient();
-  const items = [];
-  for (const def of SETTINGS) {
-    const lim = WRITE_LIMITS[def.key];
-    const base = { key: def.key, label: def.label, unit: def.unit, editable: Boolean(lim) };
-    if (lim) Object.assign(base, { group: lim.group, min: lim.min, max: lim.max, step: lim.step });
-    try {
-      const value = await client.readSetting(def);
-      items.push({ ...base, value });
-    } catch (e) {
-      items.push({ ...base, value: null, error: e.message });
-    }
-  }
-  return { at: Date.now(), items };
-}
-
-/**
- * Запись настроек. Принимает только явное подтверждение (confirm: true), проверяет пределы
- * и связи порогов с текущими значениями платы, пишет одной операцией и сверяет каждое
- * значение чтением после записи.
- */
-async function writeSettingsApi(body) {
-  const client = requireClient();
-  if (body.confirm !== true) throw httpError(400, 'NOT_CONFIRMED', 'Запись не подтверждена.');
-  const changes = body.changes && typeof body.changes === 'object' ? body.changes : null;
-  if (!changes) throw httpError(400, 'BAD_CHANGES', 'Не переданы изменения.');
-  const keys = Object.keys(changes);
-  if (keys.length === 0) throw httpError(400, 'NO_CHANGES', 'Нет изменений для записи.');
-  if (keys.length > 40) throw httpError(400, 'TOO_MANY', 'Слишком много изменений за один раз.');
-
-  const writable = new Set(writableDefs().map((d) => d.key));
-  const errors = [];
-  for (const key of keys) {
-    if (!writable.has(key)) { errors.push(`параметр «${key}» нельзя записать из приложения`); continue; }
-    const value = Number(changes[key]);
-    const err = checkSettingValue(key, value);
-    if (err) errors.push(err);
-  }
-  if (errors.length) throw httpError(400, 'INVALID_VALUES', errors.join('; '));
-
-  let password;
-  try {
-    password = typeof body.password === 'string' ? body.password : '';
-    passwordBytes(password);
-  } catch (e) {
-    throw httpError(400, 'BAD_PASSWORD', e.message);
-  }
-  const save = body.save !== false;
-
-  // текущие значения платы: нужны для сравнения и для проверки связей порогов
-  const current = {};
-  for (const def of SETTINGS) {
-    try { current[def.key] = await client.readSetting(def); } catch { /* значение не прочитано — связь не проверяем */ }
-  }
-  const merged = { ...current };
-  for (const key of keys) merged[key] = Number(changes[key]);
-  const consistency = checkSettingsConsistency(merged);
-  if (consistency.length) throw httpError(400, 'INCONSISTENT', consistency.join('; '));
-
-  const defs = keys.map((key) => SETTINGS.find((d) => d.key === key));
-  const toWrite = defs
-    .filter((d) => current[d.key] === undefined || Number(current[d.key]) !== Number(changes[d.key]))
-    .map((d) => ({ def: d, value: Number(changes[d.key]), raw: settingToRaw(d, Number(changes[d.key])) }));
-  if (toWrite.length === 0) {
-    return { ok: true, saved: false, changed: 0, items: [], message: 'Значения уже совпадают с платой — ничего не записано.' };
-  }
-
-  try {
-    await client.writeSettings(toWrite.map((w) => ({ reg: w.def.reg, raw: w.raw })), { save, password });
-  } catch (e) {
-    throw httpError(502, 'WRITE_FAILED', `Запись не выполнена: ${e.message}. Изменения не сохранены в память платы.`);
-  }
-
-  const items = [];
-  for (const w of toWrite) {
-    let actual = null;
-    let ok = false;
-    try {
-      const raw = await client.readRaw(w.def);
-      actual = decodeRawForDef(w.def, raw);
-      ok = raw === w.raw;
-    } catch (e) {
-      actual = null;
-    }
-    items.push({
-      key: w.def.key, label: w.def.label, unit: w.def.unit,
-      before: current[w.def.key] ?? null, requested: w.value, actual, ok,
-    });
-  }
-  const allOk = items.every((i) => i.ok);
-  return {
-    ok: allOk,
-    saved: save && allOk,
-    changed: toWrite.length,
-    items,
-    message: allOk
-      ? (save
-        ? `Записано ${toWrite.length} ${plural(toWrite.length)} и сохранено в память платы.`
-        : `Записано ${toWrite.length} ${plural(toWrite.length)} (до выключения платы).`)
-      : 'Часть значений не совпала при проверке. Перечитайте настройки и повторите запись.',
-  };
-}
-
-function plural(n) {
-  const m10 = n % 10;
-  const m100 = n % 100;
-  if (m10 === 1 && m100 !== 11) return 'параметр';
-  if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return 'параметра';
-  return 'параметров';
-}
-
-function decodeRawForDef(def, raw) {
-  return decodeSetting(def, Buffer.from([raw >> 8, raw & 0xff]));
-}
-
-
-// ---------- управление ----------
-
-function requireConfirm(body) {
-  if (body.confirm !== true) throw httpError(400, 'NOT_CONFIRMED', 'Действие не подтверждено.');
-}
-
-/** Ключи заряда и разряда. Регистр 0xE1, без сохранения в память платы. */
-async function setFetApi(body) {
-  const client = requireClient();
-  requireConfirm(body);
-  if (typeof body.charge !== 'boolean' || typeof body.discharge !== 'boolean') {
-    throw httpError(400, 'BAD_FLAGS', 'Укажите charge и discharge (true/false).');
-  }
-  const raw = fetRaw({ charge: body.charge, discharge: body.discharge });
-  try {
-    await client.writeSettings([{ reg: CTRL_REG.CHG_DSG_EN, raw }], { save: false });
-  } catch (e) {
-    throw httpError(502, 'WRITE_FAILED', `Не удалось переключить ключи: ${e.message}`);
-  }
-  const basic = await client.readBasicInfo();
-  const ok = basic.chargeFetOn === body.charge && basic.dischargeFetOn === body.discharge;
-  return {
-    ok,
-    chargeFetOn: basic.chargeFetOn,
-    dischargeFetOn: basic.dischargeFetOn,
-    message: ok ? 'Ключи переключены.' : 'Плата показывает другое состояние ключей. Проверьте её вручную.',
-  };
-}
-
-/** Остаток ёмкости (SOC). Регистр 0xE0, без сохранения. */
-async function setCapacityApi(body) {
-  const client = requireClient();
-  requireConfirm(body);
-  const ah = Number(body.ah);
-  let raw;
-  try { raw = capRemRaw(ah); } catch (e) { throw httpError(400, 'BAD_VALUE', e.message); }
-  const basic = await client.readBasicInfo();
-  if (ah < 0 || ah > basic.fullAh) {
-    throw httpError(400, 'OUT_OF_RANGE', `Остаток должен быть от 0 до ${basic.fullAh} Ач (полная ёмкость).`);
-  }
-  try {
-    await client.writeSettings([{ reg: CTRL_REG.CAP_REM, raw }], { save: false });
-  } catch (e) {
-    throw httpError(502, 'WRITE_FAILED', `Не удалось установить остаток: ${e.message}`);
-  }
-  const after = await client.readBasicInfo();
-  return { ok: Math.abs(after.remainingAh - ah) < 0.05, remainingAh: after.remainingAh, fullAh: after.fullAh };
-}
-
-/** Сброс счётчиков ошибок: вход и выход из заводского режима с сохранением (как в bms-tools). */
-async function clearErrorsApi(body) {
-  const client = requireClient();
-  requireConfirm(body);
-  try {
-    await client.writeSettings([], { save: true });
-  } catch (e) {
-    throw httpError(502, 'WRITE_FAILED', `Не удалось сбросить счётчики: ${e.message}`);
-  }
-  const errors = await client.readErrorCounters();
-  const nonZero = Object.values(errors).some((v) => v !== 0);
-  return { ok: !nonZero, errors, message: nonZero ? 'Часть счётчиков не обнулилась.' : 'Счётчики ошибок сброшены.' };
-}
-
-/** Текущие значения всех настроек (для резервной копии и сравнения). */
-async function currentSettingsMap(client) {
-  const out = {};
-  for (const def of SETTINGS) {
-    try { out[def.key] = await client.readSetting(def); } catch { /* пропускаем нечитаемые */ }
-  }
-  return out;
-}
-
-async function backupApi() {
-  const client = requireClient();
-  const values = await currentSettingsMap(client);
-  return {
-    format: 'jbd-settings',
-    version: 1,
-    createdAt: new Date().toISOString(),
-    device: session.deviceName || '',
-    items: values,
-  };
-}
-
-/** Восстановление: dryRun — только перечень изменений; иначе — запись через обычный путь записи. */
-async function restoreApi(body) {
-  const client = requireClient();
-  const file = body.file;
-  if (!file || file.format !== 'jbd-settings' || typeof file.items !== 'object' || file.items === null) {
-    throw httpError(400, 'BAD_BACKUP', 'Файл не похож на копию настроек JBD BMS.');
-  }
-  const current = await currentSettingsMap(client);
-  const writable = new Set(writableDefs().map((d) => d.key));
-  const changes = {};
-  const skipped = [];
-  const errors = [];
-  const rows = [];
-  for (const [key, value] of Object.entries(file.items)) {
-    if (!writable.has(key)) { skipped.push(key); continue; }
-    if (typeof value !== 'number') { errors.push(`«${key}»: не число`); continue; }
-    const err = checkSettingValue(key, value);
-    if (err) { errors.push(err); continue; }
-    if (current[key] === undefined || Number(current[key]) !== value) {
-      changes[key] = value;
-      const def = SETTINGS.find((d) => d.key === key);
-      rows.push({ key, label: def.label, unit: def.unit, from: current[key] ?? null, to: value });
-    }
-  }
-  if (errors.length) throw httpError(400, 'INVALID_VALUES', errors.join('; '));
-  if (body.dryRun !== false) {
-    return { dryRun: true, changes: rows, skipped, same: Object.keys(file.items).length - rows.length - skipped.length };
-  }
-  if (rows.length === 0) return { ok: true, saved: false, changed: 0, items: [], message: 'Копия совпадает с платой — ничего не записано.' };
-  return writeSettingsApi({ confirm: body.confirm, changes, save: body.save, password: body.password });
+/** Опрос всех портов, кроме занятых подключёнными банками. */
+async function scanApi({ includeConnected = false } = {}) {
+  const used = new Set(banks.list().map((b) => b.path));
+  const ports = (await listSerialPorts()).filter((p) => includeConnected || !used.has(p.path));
+  const results = await scanBmsPorts(ports);
+  return { at: Date.now(), results, found: results.filter((r) => r.found).map((r) => r.path), busy: [...used] };
 }
 
 // ---------- HTTP ----------
@@ -431,104 +149,260 @@ function readBody(req, limit = MAX_BODY) {
 }
 
 async function readJson(req) {
-  const buf = await readBody(req, 64 * 1024);
+  const buf = await readBody(req, 256 * 1024);
   if (!buf.length) return {};
   try { return JSON.parse(buf.toString('utf8')); } catch { throw httpError(400, 'BAD_JSON', 'Некорректный JSON.'); }
 }
 
-const PORT_RE = /^\/dev\/(tty[A-Za-z0-9]+|cu\.[A-Za-z0-9._-]+)$|^COM\d+$/i;
+const PORT_RE = /^\/dev\/(tty[A-Za-z0-9._-]+|cu\.[A-Za-z0-9._-]+)$|^COM\d+$/i;
+
+function checkPath(path) {
+  if (path !== 'demo' && !PORT_RE.test(path)) throw httpError(400, 'BAD_PORT', 'Недопустимое имя порта.');
+  return path;
+}
+
+function secondsOf(url) {
+  const raw = Number(url.searchParams.get('seconds') || url.searchParams.get('window') || 600);
+  return Math.max(15, Math.min(7200, Number.isFinite(raw) && raw > 0 ? raw : 600));
+}
 
 async function handleApi(req, res, url) {
   const { pathname } = url;
-  if (req.method === 'GET' && pathname === '/healthz') {
-    return send(res, 200, { ok: true, ...VERSION });
-  }
-  if (req.method === 'GET' && pathname === '/api/ports') {
-    return send(res, 200, { ports: await listSerialPorts(), demo: { path: 'demo', label: 'Демо-режим (без платы)' } });
-  }
-  if (req.method === 'POST' && pathname === '/api/connect') {
-    const body = await readJson(req);
-    const path = String(body.path || '');
-    if (path !== 'demo' && !PORT_RE.test(path)) throw httpError(400, 'BAD_PORT', 'Недопустимое имя порта.');
-    try {
-      const { basic, deviceName } = await connect(path);
-      return send(res, 200, { connected: true, port: path, demo: path === 'demo', deviceName, firmwareVersion: basic.firmwareVersion, cellCount: basic.cellCount });
-    } catch (e) {
-      const busy = /^не удалось открыть/.test(e.message);
-      const text = busy
-        ? `Порт ${path} не открылся (${e.message}). Закройте другие программы, которые могут его занимать (например, JBDTools), и проверьте права доступа: в Ubuntu — группа dialout.`
-        : `Плата не отвечает: ${e.message}. Проверьте провода (TX/RX/GND), уровень 3.3 В и выбран ли нужный порт. Если не знаете порт, нажмите «Найти батарею».`;
-      session.lastError = text;
-      throw httpError(502, 'CONNECT_FAILED', text);
-    }
-  }
-  if (req.method === 'POST' && pathname === '/api/scan') {
-    return send(res, 200, await scanApi());
-  }
-  if (req.method === 'POST' && pathname === '/api/disconnect') {
-    await disconnect();
-    return send(res, 200, { connected: false });
-  }
-  if (req.method === 'GET' && pathname === '/api/state') {
+  const q = url.searchParams;
+  const method = req.method;
+
+  if (method === 'GET' && pathname === '/healthz') return send(res, 200, { ok: true, ...VERSION });
+
+  // ----- каталог и списки -----
+  if (method === 'GET' && pathname === '/api/catalog') {
     return send(res, 200, {
-      connected: Boolean(session.client),
-      port: session.port,
-      demo: session.demo,
-      deviceName: session.deviceName,
-      lastError: session.lastError,
-      firmwareLoaded: session.firmwareText !== null,
-      firmwareName: session.firmwareName,
+      settings: SETTINGS.map((d) => {
+        const lim = WRITE_LIMITS[d.key];
+        return {
+          key: d.key, label: d.label, unit: d.unit, reg: d.reg, hex: `0x${d.reg.toString(16).padStart(2, '0')}`,
+          kind: d.kind, byte: d.byte ?? null, group: lim?.group ?? d.group ?? 'Прочее',
+          editable: Boolean(lim), risky: Boolean(lim?.risky), min: lim?.min ?? null, max: lim?.max ?? null, step: lim?.step ?? null,
+          bits: d.bits ?? null,
+        };
+      }),
+      info: INFO_REGS.map((d) => ({ ...d, hex: `0x${d.reg.toString(16).padStart(2, '0')}` })),
+      control: CONTROL_CMDS,
+      regs: REG_CATALOG,
+      faults: FAULT_BITS,
+      errorCounters: ERROR_COUNTER_NAMES.map(([key, label]) => ({ key, label })),
+      writable: writableDefs().map((d) => d.key),
     });
   }
-  if (req.method === 'GET' && pathname === '/api/snapshot') {
+  if (method === 'GET' && pathname === '/api/ports') {
+    const used = new Set(banks.list().map((b) => b.path));
+    return send(res, 200, {
+      ports: (await listSerialPorts()).map((p) => ({ ...p, used: used.has(p.path) })),
+      demo: { path: 'demo', label: 'Демо-режим (без платы)' },
+    });
+  }
+
+  // ----- панель -----
+  if (method === 'GET' && pathname === '/api/panel') {
+    return send(res, 200, banks.panel({ focus: q.get('focus'), seconds: secondsOf(url) }));
+  }
+  if (method === 'GET' && pathname === '/api/banks') return send(res, 200, { at: Date.now(), pollMs: banks.pollMs, banks: banks.list().map((b) => banks.row(b)) });
+  if (method === 'POST' && pathname === '/api/banks/add') {
+    const body = await readJson(req);
+    const path = checkPath(String(body.path || ''));
     try {
-      return send(res, 200, await snapshot());
+      const bank = await banks.add({ path, label: String(body.label || '') });
+      return send(res, 200, { id: bank.id, path: bank.path, label: bank.label, deviceName: bank.deviceName, cellCount: bank.basic?.cellCount ?? 0 });
     } catch (e) {
-      session.failures++;
-      session.lastError = e.message;
-      if (session.failures >= 3) await disconnect();
-      throw httpError(502, 'READ_FAILED', `Нет ответа от BMS: ${e.message}`);
+      if (e.status) throw e;
+      throw httpError(502, 'CONNECT_FAILED', connectHint(path, e.message));
     }
   }
-  if (req.method === 'GET' && pathname === '/api/settings') {
-    return send(res, 200, await readSettings());
+  if (method === 'POST' && pathname === '/api/banks/demo') {
+    const body = await readJson(req);
+    const count = Math.max(1, Math.min(6, Number(body.count) || 4));
+    const added = [];
+    for (let i = 0; i < count; i++) {
+      const bank = await banks.add({ path: 'demo', label: `ДЕМО ${String.fromCharCode(65 + i)}`, demo: true });
+      added.push({ id: bank.id, label: bank.label, cellCount: bank.basic?.cellCount ?? 0 });
+    }
+    return send(res, 200, { added });
   }
-  if (req.method === 'POST' && pathname === '/api/control/fet') return send(res, 200, await setFetApi(await readJson(req)));
-  if (req.method === 'POST' && pathname === '/api/control/capacity') return send(res, 200, await setCapacityApi(await readJson(req)));
-  if (req.method === 'POST' && pathname === '/api/control/clear-errors') return send(res, 200, await clearErrorsApi(await readJson(req)));
-  if (req.method === 'GET' && pathname === '/api/backup') return send(res, 200, await backupApi());
-  if (req.method === 'POST' && pathname === '/api/backup/restore') return send(res, 200, await restoreApi(await readJson(req)));
-  if (req.method === 'POST' && pathname === '/api/settings/write') {
-    return send(res, 200, await writeSettingsApi(await readJson(req)));
+  if (method === 'POST' && pathname === '/api/banks/auto') {
+    const scan = await scanApi({ includeConnected: q.get('force') === '1' });
+    const r = await banks.autoConnect({ ports: scan.results, results: scan.results });
+    return send(res, 200, { ...r, scanned: scan.results.length });
   }
-  if (req.method === 'POST' && pathname === '/api/firmware/inspect') {
+  if (method === 'POST' && pathname === '/api/banks/remove') {
+    const body = await readJson(req);
+    const id = String(body.id || '');
+    if (!id) throw httpError(400, 'NO_ID', 'Не указан банк.');
+    return send(res, 200, await banks.remove(id));
+  }
+  if (method === 'POST' && pathname === '/api/banks/rename') {
+    const body = await readJson(req);
+    return send(res, 200, banks.rename(String(body.id || ''), String(body.label || '')));
+  }
+  if (method === 'POST' && pathname === '/api/banks/reconnect') {
+    const body = await readJson(req);
+    return send(res, 200, await banks.reconnect(String(body.id || '')));
+  }
+  if (method === 'POST' && pathname === '/api/poll') {
+    const body = await readJson(req);
+    return send(res, 200, { pollMs: banks.setPollMs(body.ms) });
+  }
+  if (method === 'GET' && pathname === '/api/history') {
+    const id = q.get('id');
+    const bank = id ? banks.get(id) : banks.list()[0];
+    if (!bank) throw httpError(409, 'NOT_CONNECTED', 'Банки не подключены.');
+    return send(res, 200, { id: bank.id, series: banks.series(bank, { seconds: secondsOf(url) }) });
+  }
+
+  // ----- данные одного банка -----
+  if (method === 'GET' && pathname === '/api/bank/registers') {
+    const id = q.get('id') || primaryId();
+    const bank = banks.get(id);
+    const settings = await banks.readSettings(bank.id);
+    return send(res, 200, {
+      at: Date.now(), id: bank.id, label: bank.label, port: bank.path,
+      info: bank.info, infoAt: bank.infoAt, deviceName: bank.deviceName,
+      basic: bank.basic, cells: bank.cells, errors: bank.errors, settings: settings.items,
+    });
+  }
+  if (method === 'GET' && pathname === '/api/bank/info') {
+    const id = q.get('id') || primaryId();
+    const bank = banks.get(id);
+    return send(res, 200, { at: Date.now(), info: await banks.readInfo(bank) });
+  }
+  if (method === 'GET' && pathname === '/api/bank/settings') {
+    return send(res, 200, await banks.readSettings(q.get('id') || primaryId()));
+  }
+  if (method === 'POST' && pathname === '/api/bank/settings/write') {
+    const body = await readJson(req);
+    return send(res, 200, await banks.writeSettings(body.id || primaryId(), body));
+  }
+  if (method === 'POST' && pathname === '/api/bank/control') {
+    const body = await readJson(req);
+    const action = String(body.action || '');
+    return send(res, 200, await banks.control(body.id || primaryId(), action, body));
+  }
+  if (method === 'POST' && pathname === '/api/bank/raw/read') {
+    const body = await readJson(req);
+    const regs = Array.isArray(body.regs) ? body.regs : [];
+    if (!regs.length) throw httpError(400, 'NO_REGS', 'Не указаны регистры.');
+    return send(res, 200, await banks.rawRead(body.id || primaryId(), regs));
+  }
+  if (method === 'POST' && pathname === '/api/bank/raw/write') {
+    const body = await readJson(req);
+    return send(res, 200, await banks.rawWrite(body.id || primaryId(), body));
+  }
+  if (method === 'GET' && pathname === '/api/backup') {
+    return send(res, 200, await banks.backup(q.get('id') || primaryId()));
+  }
+  if (method === 'POST' && pathname === '/api/backup/restore') {
+    const body = await readJson(req);
+    const file = body.file;
+    if (!file || typeof file.items !== 'object' || file.items === null) {
+      throw httpError(400, 'BAD_BACKUP', 'Файл не похож на копию настроек JBD BMS.');
+    }
+    return send(res, 200, await banks.restore(body.id || primaryId(), { ...body, items: file.items }));
+  }
+
+  // ----- отчёт по всему парку -----
+  if (method === 'GET' && pathname === '/api/report') {
+    return send(res, 200, await banks.report({ id: q.get('id') || null, settings: q.get('settings') !== '0' }));
+  }
+  if (method === 'GET' && pathname === '/api/report.csv') {
+    await Promise.all(banks.list().map((b) => banks.readSettings(b.id).catch(() => null)));
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+    return send(res, 200, '\ufeff' + banks.csv(), {
+      'content-type': 'text/csv; charset=utf-8',
+      'content-disposition': `attachment; filename="bms-report-${stamp}.csv"`,
+    });
+  }
+
+  // ----- старые одиночные адреса -----
+  if (method === 'POST' && pathname === '/api/connect') {
+    const body = await readJson(req);
+    const path = checkPath(String(body.path || ''));
+    await banks.removeAll();
+    try {
+      const bank = await banks.add({ path });
+      return send(res, 200, {
+        connected: true, port: path, demo: path === 'demo', deviceName: bank.deviceName,
+        firmwareVersion: bank.basic?.firmwareVersion ?? 0, cellCount: bank.basic?.cellCount ?? 0, id: bank.id,
+      });
+    } catch (e) {
+      if (e.status && e.code === 'CONNECT_FAILED') throw e;
+      throw httpError(502, 'CONNECT_FAILED', connectHint(path, e.message));
+    }
+  }
+  if (method === 'POST' && pathname === '/api/disconnect') {
+    await banks.removeAll();
+    return send(res, 200, { connected: false });
+  }
+  if (method === 'POST' && pathname === '/api/scan') {
+    return send(res, 200, await scanApi());
+  }
+  if (method === 'GET' && pathname === '/api/state') {
+    const bank = banks.list()[0] ?? null;
+    return send(res, 200, {
+      connected: Boolean(bank?.connected), port: bank?.path ?? null, demo: Boolean(bank?.demo),
+      deviceName: bank?.deviceName ?? '', lastError: bank?.lastError ?? '',
+      banks: banks.list().length,
+      firmwareLoaded: firmware.text !== null, firmwareName: firmware.name,
+    });
+  }
+  if (method === 'GET' && pathname === '/api/snapshot') {
+    const bank = banks.get(q.get('id') || primaryId());
+    if (!bank.connected) throw httpError(502, 'READ_FAILED', `Нет ответа от BMS: ${bank.lastError || 'банк не подключён'}`);
+    return send(res, 200, legacySnapshot(bank));
+  }
+  if (method === 'GET' && pathname === '/api/settings') {
+    return send(res, 200, await banks.readSettings(primaryId()));
+  }
+  if (method === 'POST' && pathname === '/api/settings/write') {
+    const body = await readJson(req);
+    return send(res, 200, await banks.writeSettings(primaryId(), body));
+  }
+  if (method === 'POST' && pathname === '/api/control/fet') {
+    const body = await readJson(req);
+    return send(res, 200, await banks.control(primaryId(), 'fet', { ...body, charge: body.charge, discharge: body.discharge }));
+  }
+  if (method === 'POST' && pathname === '/api/control/capacity') {
+    const body = await readJson(req);
+    return send(res, 200, await banks.control(primaryId(), 'capacity', body));
+  }
+  if (method === 'POST' && pathname === '/api/control/clear-errors') {
+    const body = await readJson(req);
+    return send(res, 200, await banks.control(primaryId(), 'clear-errors', body));
+  }
+
+  // ----- прошивка -----
+  if (method === 'POST' && pathname === '/api/firmware/inspect') {
     const text = (await readBody(req, 1024 * 1024)).toString('utf8');
     const name = decodeURIComponent(String(req.headers['x-file-name'] || 'firmware.hex'));
     const info = inspectFirmwareFile(text, name);
-    session.firmwareText = info.ok ? text : null;
-    session.firmwareName = info.ok ? info.fileName : '';
+    firmware.text = info.ok ? text : null;
+    firmware.name = info.ok ? info.fileName : '';
     return send(res, 200, info);
   }
-  if (req.method === 'POST' && pathname === '/api/firmware/flash') {
-    const client = requireClient();
-    if (session.firmwareText === null) throw httpError(409, 'NO_FILE', 'Сначала загрузите корректный файл прошивки.');
-    const image = parseIntelHex(session.firmwareText);
+  if (method === 'POST' && pathname === '/api/firmware/flash') {
+    const bank = banks.get(primaryId());
+    if (firmware.text === null) throw httpError(409, 'NO_FILE', 'Сначала загрузите корректный файл прошивки.');
+    const image = parseIntelHex(firmware.text);
     try {
-      await flashFirmware(client, image);
+      await flashFirmware(bank.client, image);
       return send(res, 200, { ok: true });
     } catch (e) {
       if (e instanceof FirmwareError) throw httpError(409, e.code, e.message);
       throw e;
     }
   }
-  if (req.method === 'GET' && pathname === '/update/check') {
-    return send(res, 200, await updater.check());
-  }
-  if (req.method === 'POST' && pathname === '/update/run') {
-    const snap = updater.run();
-    return send(res, 202, snap);
-  }
-  if (req.method === 'GET' && pathname === '/update/status') {
+
+  // ----- обновления -----
+  if (method === 'GET' && pathname === '/update/check') return send(res, 200, await updater.check());
+  if (method === 'POST' && pathname === '/update/run') return send(res, 202, updater.run());
+  if (method === 'GET' && pathname === '/update/status') {
     const snap = updater.snapshot();
     if (snap.restartRequired) scheduleRestart();
     return send(res, 200, snap);
@@ -536,12 +410,23 @@ async function handleApi(req, res, url) {
   throw httpError(404, 'NOT_FOUND', 'Нет такого адреса.');
 }
 
+/** Подсказка к ошибке подключения: что делать, если порт не открылся или молчит. */
+function connectHint(path, message) {
+  if (/не удалось открыть|Permission denied|EACCES|resource busy|Device or resource busy/i.test(message)) {
+    return `Порт ${path} не открылся (${message}). Закройте другие программы, которые могут его занимать (например, JBDTools), и проверьте права доступа: в Ubuntu — группа dialout.`;
+  }
+  if (/не отвечает/i.test(message)) return message;
+  return `Плата не отвечает: ${message}. Проверьте провода (TX/RX/GND), уровень 3.3 В и выбран ли нужный порт. Если не знаете порт — «Найти и подключить все».`;
+}
+
+const updater = createUpdater({ appDir: APP_DIR, log: (m) => console.log('автообновление: ' + m) });
+
 let restartScheduled = false;
 function scheduleRestart() {
   if (restartScheduled) return;
   restartScheduled = true;
   setTimeout(async () => {
-    await disconnect();
+    await banks.removeAll();
     process.exit(RESTART_EXIT_CODE);
   }, 1500);
 }
@@ -549,6 +434,16 @@ function scheduleRestart() {
 async function serveStatic(req, res, pathname) {
   let rel = decodeURIComponent(pathname);
   if (rel === '/') rel = '/index.html';
+  // тексты инструкций лежат вне сборки (docs/) — отдаём их как есть, только .md из этой папки
+  if (rel.startsWith('/docs/')) {
+    const file = normalize(join(APP_DIR, 'docs', basename(rel)));
+    if (file.startsWith(join(APP_DIR, 'docs')) && file.endsWith('.md')) {
+      try {
+        const body = await readFile(file);
+        return send(res, 200, body, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-cache' });
+      } catch { /* ниже — обычная обработка статики */ }
+    }
+  }
   const file = normalize(join(DIST, rel));
   if (!file.startsWith(DIST)) return send(res, 403, { error: 'FORBIDDEN', message: 'Доступ запрещён.' });
   try {
@@ -611,7 +506,21 @@ if (isMain && process.argv.includes('--update-now')) {
 if (isMain) {
   const host = process.env.BMS_APP_HOST || '127.0.0.1';
   const port = Number(process.argv[2] || process.env.BMS_APP_PORT || 8585);
+  const demoFirst = process.env.BMS_DEMO_BANKS ? Number(process.env.BMS_DEMO_BANKS) : 0;
   const server = createAppServer();
+  if (demoFirst > 0) {
+    for (let i = 0; i < Math.min(6, demoFirst); i++) {
+      await banks.add({ path: 'demo', label: `ДЕМО ${String.fromCharCode(65 + i)}`, demo: true }).catch(() => {});
+    }
+  }
+  // BMS_AUTOCONNECT=1 — при старте опросить все порты и подключить каждую найденную плату
+  if (process.env.BMS_AUTOCONNECT === '1' && !demoFirst) {
+    setTimeout(() => {
+      scanApi().then((scan) => banks.autoConnect({ ports: scan.results, results: scan.results }))
+        .then((r) => r.added.length && console.log(`автоподключение: банков ${r.added.length}`))
+        .catch(() => { /* плат нет — просто стартуем с пустой панелью */ });
+    }, 300).unref();
+  }
   server.listen(port, host, () => {
     console.log(`JBD BMS: http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${port}  (версия ${VERSION.app}${VERSION.commit ? ', ' + VERSION.commit : ''})`);
   });
@@ -624,11 +533,11 @@ if (isMain) {
   setInterval(() => updater.check(), updater.CHECK_INTERVAL_MS).unref();
 
   const shutdown = async () => {
-    await disconnect();
+    banks.stop();
+    await banks.removeAll();
     server.close();
     process.exit(0);
   };
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 }
-
