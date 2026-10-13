@@ -426,7 +426,7 @@ async function readJson(req) {
   try { return JSON.parse(buf.toString('utf8')); } catch { throw httpError(400, 'BAD_JSON', 'Некорректный JSON.'); }
 }
 
-const PORT_RE = /^\/dev\/(tty[A-Za-z0-9]+|cu\.[A-Za-z0-9._-]+)$|^COM\d+$/;
+const PORT_RE = /^\/dev\/(tty[A-Za-z0-9]+|cu\.[A-Za-z0-9._-]+)$|^COM\d+$/i;
 
 async function handleApi(req, res, url) {
   const { pathname } = url;

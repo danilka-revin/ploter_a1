@@ -29,7 +29,7 @@ export async function api<T>(path: string, init: RequestInit = {}, timeoutMs = 1
   } catch (e: any) {
     if (e?.name === 'AbortError') throw new ApiError('Сервер не ответил вовремя.', 'TIMEOUT', 0);
     if (e instanceof ApiError) throw e;
-    throw new ApiError('Нет связи с локальным сервером JBD BMS. Запустите его: bash run.sh', 'NETWORK', 0);
+    throw new ApiError('Нет связи с локальным сервером JBD BMS. Запустите его через run-windows.cmd или bash run.sh', 'NETWORK', 0);
   } finally {
     clearTimeout(timer);
   }

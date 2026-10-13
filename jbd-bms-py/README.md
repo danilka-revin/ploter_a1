@@ -1,4 +1,4 @@
-# JBD BMS — приложение для Ubuntu (Python)
+# JBD BMS — приложение для Windows и Linux (Python)
 
 Программа для чтения и настройки платы BMS JBD (Jiabaida / Xiaoxiang) по UART.
 Рассчитана на батарею **12S 3P LiFePO4 (~40 В)**, номинальная ёмкость — параметр платы.
@@ -22,6 +22,20 @@
 
 Прошивка не реализована: протокол загрузки не подтверждён.
 
+## Установка (Windows 10/11)
+
+Установите [Git](https://git-scm.com/download/win) и [Python 3.10+](https://www.python.org/downloads/windows/) (с опцией **Add Python to PATH**), затем:
+
+```powershell
+git clone https://github.com/danilka-revin/ploter_a1.git
+cd ploter_a1\jbd-bms-py
+.\install-windows.cmd
+```
+
+Установщик создаст виртуальное окружение и ярлык **JBD BMS Python**. Последующий запуск —
+ярлыком или `run-windows.cmd`. Порт платы в Windows имеет имя `COM3`, `COM4` и т. п.
+Драйвер USB–UART (CH340, CP210x, FTDI) должен быть установлен.
+
 ## Установка (Ubuntu / Debian / Mint)
 
 ```bash
@@ -39,7 +53,8 @@ bash install-ubuntu.sh
 ```bash
 ./run.sh                 # окно программы
 ./run.sh --demo          # демо-режим без платы (эмулятор 12S)
-./run.sh --port /dev/ttyUSB0
+./run.sh --port /dev/ttyUSB0   # Linux
+run-windows.cmd --port COM3  # Windows
 ```
 
 Подключение к плате: выберите порт в списке и нажмите «Подключить».

@@ -158,7 +158,7 @@ class Updater:
         try:
             if not self._detect():
                 self._unsupported("Программа установлена не из git-клона, поэтому автообновление недоступно. "
-                                  "Переустановите её командой: bash install-ubuntu.sh (см. README).")
+                                  "Переустановите её через install-windows.cmd или install-ubuntu.sh (см. README).")
                 return self._emit()
             code, out = self._git("fetch", "--quiet", "origin", self.branch, timeout=self.timeout_fetch)
             if code != 0:
