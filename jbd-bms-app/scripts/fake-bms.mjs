@@ -3,7 +3,7 @@
 // типичные для LiFePO4-батареи 12S (12 последовательных ячеек). Запись настроек
 // принимается только в заводском режиме (как у платы) и сохраняется в EEPROM-модели.
 
-import { buildFrameForResponse, REG, SETTINGS, settingToRaw } from './jbd-protocol.mjs';
+import { buildFrameForResponse, REG, SETTINGS, settingToRaw, CTRL_REG } from './jbd-protocol.mjs';
 
 /** Значения EEPROM по умолчанию, в единицах интерфейса (мВ, мА, мАч, °C). */
 export const DEMO_SETTINGS = {
@@ -26,6 +26,8 @@ export class FakeBmsDevice {
     this.password = password ? Buffer.from(password, 'ascii') : Buffer.alloc(6);
     this.factory = false;
     this.writesSaved = 0;
+    this.fetCtrl = 0;          // регистр 0xE1: бит0 заряд выкл., бит1 разряд выкл.
+    this.remOverrideMah = null; // остаток ёмкости после ручной установки (0xE0)
     // EEPROM-модель: сырые 16-битные значения по регистрам
     this.eeprom = new Map();
     for (const def of SETTINGS) {
@@ -47,12 +49,12 @@ export class FakeBmsDevice {
       cells,
       packMv: sum,
       currentMa,
-      remainingMah: 62000 + Math.round(200 * Math.sin(t / 30)),
+      remainingMah: this.remOverrideMah ?? 62000 + Math.round(200 * Math.sin(t / 30)),
       fullMah: 100000,
       cycles: 127,
       temps: [25.4, 26.1],
-      chargeOn: true,
-      dischargeOn: true,
+      chargeOn: !(this.fetCtrl & 1),
+      dischargeOn: !(this.fetCtrl & 2),
       balance: t % 9 < 3 ? [3] : [],
       capPct: 62,
       faults: 0,
@@ -125,8 +127,18 @@ export class FakeBmsDevice {
       return buildFrameForResponse(reg, 0x00, Buffer.alloc(0));
     }
     if (reg === 0x01) {
-      if (this.factory && data.length === 2 && data[0] === 0x28 && data[1] === 0x28) this.writesSaved++;
+      if (this.factory && data.length === 2 && data[0] === 0x28 && data[1] === 0x28) {
+        this.writesSaved++;
+        this.errorCounts = this.errorCounts.map(() => 0);
+      }
       this.factory = false;
+      return buildFrameForResponse(reg, 0x00, Buffer.alloc(0));
+    }
+    if (reg === CTRL_REG.CHG_DSG_EN || reg === CTRL_REG.CAP_REM) {
+      if (!this.factory || data.length !== 2) return buildFrameForResponse(reg, 0x80, Buffer.alloc(0));
+      const raw = data.readUInt16BE(0);
+      if (reg === CTRL_REG.CHG_DSG_EN) this.fetCtrl = raw & 0x03;
+      else this.remOverrideMah = raw * 10;
       return buildFrameForResponse(reg, 0x00, Buffer.alloc(0));
     }
     const def = SETTINGS.find((d) => d.reg === reg);

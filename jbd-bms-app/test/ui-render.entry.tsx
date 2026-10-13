@@ -5,6 +5,7 @@ import { Cells } from '../src/views/Cells';
 import { Firmware } from '../src/views/Firmware';
 import { UpdateDialog } from '../src/views/UpdateDialog';
 import { Settings } from '../src/views/Settings';
+import { Control } from '../src/views/Control';
 import type { SettingsResponse } from '../src/types';
 import type { Snapshot, FirmwareInfo, UpdateSnapshot } from '../src/types';
 
@@ -103,3 +104,5 @@ const settingsData: SettingsResponse = {
   ],
 };
 export const renderSettingsWithData = () => renderToStaticMarkup(<Settings connected initialData={settingsData} />);
+
+export const renderControl = () => renderToStaticMarkup(<Control snap={snap} connected />);

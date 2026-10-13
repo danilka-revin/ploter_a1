@@ -35,6 +35,7 @@ import { BmsClient } from './bms-client.mjs';
 import {
   SETTINGS, WRITE_LIMITS, writableDefs, checkSettingValue, checkSettingsConsistency,
   settingToRaw, passwordBytes, decodeSetting,
+  CTRL_REG, fetRaw, capRemRaw,
 } from './jbd-protocol.mjs';
 import { listSerialPorts, openSerialTransport } from './serial-transport.mjs';
 import { createFakeTransport } from './fake-bms.mjs';
@@ -273,6 +274,123 @@ function decodeRawForDef(def, raw) {
   return decodeSetting(def, Buffer.from([raw >> 8, raw & 0xff]));
 }
 
+
+// ---------- управление ----------
+
+function requireConfirm(body) {
+  if (body.confirm !== true) throw httpError(400, 'NOT_CONFIRMED', 'Действие не подтверждено.');
+}
+
+/** Ключи заряда и разряда. Регистр 0xE1, без сохранения в память платы. */
+async function setFetApi(body) {
+  const client = requireClient();
+  requireConfirm(body);
+  if (typeof body.charge !== 'boolean' || typeof body.discharge !== 'boolean') {
+    throw httpError(400, 'BAD_FLAGS', 'Укажите charge и discharge (true/false).');
+  }
+  const raw = fetRaw({ charge: body.charge, discharge: body.discharge });
+  try {
+    await client.writeSettings([{ reg: CTRL_REG.CHG_DSG_EN, raw }], { save: false });
+  } catch (e) {
+    throw httpError(502, 'WRITE_FAILED', `Не удалось переключить ключи: ${e.message}`);
+  }
+  const basic = await client.readBasicInfo();
+  const ok = basic.chargeFetOn === body.charge && basic.dischargeFetOn === body.discharge;
+  return {
+    ok,
+    chargeFetOn: basic.chargeFetOn,
+    dischargeFetOn: basic.dischargeFetOn,
+    message: ok ? 'Ключи переключены.' : 'Плата показывает другое состояние ключей. Проверьте её вручную.',
+  };
+}
+
+/** Остаток ёмкости (SOC). Регистр 0xE0, без сохранения. */
+async function setCapacityApi(body) {
+  const client = requireClient();
+  requireConfirm(body);
+  const ah = Number(body.ah);
+  let raw;
+  try { raw = capRemRaw(ah); } catch (e) { throw httpError(400, 'BAD_VALUE', e.message); }
+  const basic = await client.readBasicInfo();
+  if (ah < 0 || ah > basic.fullAh) {
+    throw httpError(400, 'OUT_OF_RANGE', `Остаток должен быть от 0 до ${basic.fullAh} Ач (полная ёмкость).`);
+  }
+  try {
+    await client.writeSettings([{ reg: CTRL_REG.CAP_REM, raw }], { save: false });
+  } catch (e) {
+    throw httpError(502, 'WRITE_FAILED', `Не удалось установить остаток: ${e.message}`);
+  }
+  const after = await client.readBasicInfo();
+  return { ok: Math.abs(after.remainingAh - ah) < 0.05, remainingAh: after.remainingAh, fullAh: after.fullAh };
+}
+
+/** Сброс счётчиков ошибок: вход и выход из заводского режима с сохранением (как в bms-tools). */
+async function clearErrorsApi(body) {
+  const client = requireClient();
+  requireConfirm(body);
+  try {
+    await client.writeSettings([], { save: true });
+  } catch (e) {
+    throw httpError(502, 'WRITE_FAILED', `Не удалось сбросить счётчики: ${e.message}`);
+  }
+  const errors = await client.readErrorCounters();
+  const nonZero = Object.values(errors).some((v) => v !== 0);
+  return { ok: !nonZero, errors, message: nonZero ? 'Часть счётчиков не обнулилась.' : 'Счётчики ошибок сброшены.' };
+}
+
+/** Текущие значения всех настроек (для резервной копии и сравнения). */
+async function currentSettingsMap(client) {
+  const out = {};
+  for (const def of SETTINGS) {
+    try { out[def.key] = await client.readSetting(def); } catch { /* пропускаем нечитаемые */ }
+  }
+  return out;
+}
+
+async function backupApi() {
+  const client = requireClient();
+  const values = await currentSettingsMap(client);
+  return {
+    format: 'jbd-settings',
+    version: 1,
+    createdAt: new Date().toISOString(),
+    device: session.deviceName || '',
+    items: values,
+  };
+}
+
+/** Восстановление: dryRun — только перечень изменений; иначе — запись через обычный путь записи. */
+async function restoreApi(body) {
+  const client = requireClient();
+  const file = body.file;
+  if (!file || file.format !== 'jbd-settings' || typeof file.items !== 'object' || file.items === null) {
+    throw httpError(400, 'BAD_BACKUP', 'Файл не похож на копию настроек JBD BMS.');
+  }
+  const current = await currentSettingsMap(client);
+  const writable = new Set(writableDefs().map((d) => d.key));
+  const changes = {};
+  const skipped = [];
+  const errors = [];
+  const rows = [];
+  for (const [key, value] of Object.entries(file.items)) {
+    if (!writable.has(key)) { skipped.push(key); continue; }
+    if (typeof value !== 'number') { errors.push(`«${key}»: не число`); continue; }
+    const err = checkSettingValue(key, value);
+    if (err) { errors.push(err); continue; }
+    if (current[key] === undefined || Number(current[key]) !== value) {
+      changes[key] = value;
+      const def = SETTINGS.find((d) => d.key === key);
+      rows.push({ key, label: def.label, unit: def.unit, from: current[key] ?? null, to: value });
+    }
+  }
+  if (errors.length) throw httpError(400, 'INVALID_VALUES', errors.join('; '));
+  if (body.dryRun !== false) {
+    return { dryRun: true, changes: rows, skipped, same: Object.keys(file.items).length - rows.length - skipped.length };
+  }
+  if (rows.length === 0) return { ok: true, saved: false, changed: 0, items: [], message: 'Копия совпадает с платой — ничего не записано.' };
+  return writeSettingsApi({ confirm: body.confirm, changes, save: body.save, password: body.password });
+}
+
 // ---------- HTTP ----------
 
 const MIME = {
@@ -358,6 +476,11 @@ async function handleApi(req, res, url) {
   if (req.method === 'GET' && pathname === '/api/settings') {
     return send(res, 200, await readSettings());
   }
+  if (req.method === 'POST' && pathname === '/api/control/fet') return send(res, 200, await setFetApi(await readJson(req)));
+  if (req.method === 'POST' && pathname === '/api/control/capacity') return send(res, 200, await setCapacityApi(await readJson(req)));
+  if (req.method === 'POST' && pathname === '/api/control/clear-errors') return send(res, 200, await clearErrorsApi(await readJson(req)));
+  if (req.method === 'GET' && pathname === '/api/backup') return send(res, 200, await backupApi());
+  if (req.method === 'POST' && pathname === '/api/backup/restore') return send(res, 200, await restoreApi(await readJson(req)));
   if (req.method === 'POST' && pathname === '/api/settings/write') {
     return send(res, 200, await writeSettingsApi(await readJson(req)));
   }

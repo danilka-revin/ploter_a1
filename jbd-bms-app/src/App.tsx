@@ -8,15 +8,17 @@ import type {
 import { Overview } from './views/Overview';
 import { Cells } from './views/Cells';
 import { Settings } from './views/Settings';
+import { Control } from './views/Control';
 import { Firmware } from './views/Firmware';
 import { UpdateDialog } from './views/UpdateDialog';
 import { Icon } from './icons';
 
-type Tab = 'overview' | 'cells' | 'settings' | 'firmware';
+type Tab = 'overview' | 'cells' | 'control' | 'settings' | 'firmware';
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'overview', label: 'Обзор' },
   { id: 'cells', label: 'Ячейки' },
+  { id: 'control', label: 'Управление' },
   { id: 'settings', label: 'Защиты и настройки' },
   { id: 'firmware', label: 'Прошивка' },
 ];
@@ -276,6 +278,7 @@ export default function App() {
       <main className="content">
         {tab === 'overview' && <Overview snap={snap} connected={connected} error={pollError} />}
         {tab === 'cells' && <Cells snap={snap} connected={connected} error={pollError} />}
+        {tab === 'control' && <Control snap={snap} connected={connected} />}
         {tab === 'settings' && <Settings connected={connected} />}
         {tab === 'firmware' && <Firmware connected={connected} snap={snap} onStateChange={refreshState} />}
       </main>

@@ -382,3 +382,20 @@ export function passwordBytes(password = '') {
   Buffer.from(password, 'ascii').copy(out);
   return out;
 }
+
+// ---------- управление (заводской режим, без сохранения в память платы) ----------
+
+/** Регистры управления: ключи заряда/разряда и остаток ёмкости (как в bms-tools). */
+export const CTRL_REG = { CAP_REM: 0xe0, CHG_DSG_EN: 0xe1 };
+
+/** Ключи → значение регистра 0xE1: бит 0 = заряд выключен, бит 1 = разряд выключен. */
+export function fetRaw({ charge, discharge }) {
+  return (charge ? 0 : 1) | (discharge ? 0 : 2);
+}
+
+/** Остаток ёмкости, Ач → регистр 0xE0 (единица — 10 мАч). */
+export function capRemRaw(ah) {
+  const raw = Math.round(Number(ah) * 100);
+  if (!Number.isFinite(Number(ah)) || raw < 0 || raw > 0xffff) throw new BmsProtocolError('остаток ёмкости вне диапазона регистра');
+  return raw;
+}

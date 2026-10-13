@@ -24,10 +24,18 @@ test('экраны рендерятся на данных плате и пока
   const m = await import(pathToFileURL(outFile).href);
 
   const cellsText = m.renderCells();
-  assert.match(cellsText, /Ячейка 1/);
-  assert.match(cellsText, /3\.315 В/);
-  assert.match(cellsText, /Разброс напряжений/);
+  assert.match(cellsText, /3\.315/);
+  assert.match(cellsText, /Разброс:/);
   assert.match(cellsText, /15 мВ/);
+  assert.match(cellsText, /баланс/);
+  assert.equal((cellsText.match(/<tr/g) || []).length, 5, '4 ячейки + заголовок');
+
+  const ctl = m.renderControl();
+  assert.match(ctl, /Выключить заряд/);
+  assert.match(ctl, /Остаток ёмкости/);
+  assert.match(ctl, /Сбросить счётчики/);
+  assert.match(ctl, /Резервная копия настроек/);
+  assert.match(ctl, /Не делается в приложении/);
 
   const overview = m.renderOverview();
   assert.match(overview, /13\.27/);

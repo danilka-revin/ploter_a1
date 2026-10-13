@@ -312,3 +312,26 @@ label.btn { cursor: pointer; }
 .set-pass { display: grid; gap: 6px; font-size: 12.5px; color: var(--muted); }
 .set-pass .set-num { width: 160px; text-align: left; letter-spacing: .2em; }
 .set-modal-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; flex-wrap: wrap; }
+
+/* ---------- ячейки: компактная таблица ---------- */
+.cells-summary { display: flex; flex-wrap: wrap; gap: 6px 18px; color: var(--muted); }
+.cells-summary b { color: var(--text); font-weight: 600; }
+.cells-summary .warn b { color: var(--warn); }
+.cells-table { margin-top: 8px; }
+.cells-table td, .cells-table th { padding: 4px 8px; }
+.cells-table tr.is-min td { color: var(--warn); }
+.cells-table tr.is-max td { color: var(--accent-text); }
+.cells-table .warn { color: var(--warn); font-weight: 600; }
+.cell-track { height: 6px; min-width: 140px; }
+
+/* ---------- управление ---------- */
+.ctl-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+.ctl-card { display: flex; flex-direction: column; gap: 10px; }
+.ctl-card h3 { margin: 0; }
+.ctl-state { display: flex; gap: 8px; flex-wrap: wrap; }
+.ctl-pill { padding: 3px 9px; border-radius: 999px; border: 1px solid var(--line); font-size: 12px; }
+.ctl-pill.on { color: var(--ok-ink); background: var(--ok-bg); border-color: transparent; }
+.ctl-pill.off { color: var(--danger-ink); background: var(--danger-bg); border-color: transparent; }
+.ctl-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.ctl-confirm { border: 1px solid var(--accent-line); background: var(--accent-soft); border-radius: 10px; padding: 10px 12px; font-size: 12.5px; display: grid; gap: 8px; }
+.ctl-list { margin: 0; padding-left: 18px; font-size: 12.5px; color: var(--muted); line-height: 1.6; }
