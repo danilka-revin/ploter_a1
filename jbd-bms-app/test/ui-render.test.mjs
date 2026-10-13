@@ -31,11 +31,36 @@ test('экраны рендерятся на данных плате и пока
   assert.equal((cellsText.match(/<tr/g) || []).length, 5, '4 ячейки + заголовок');
 
   const ctl = m.renderControl();
-  assert.match(ctl, /Выключить заряд/);
   assert.match(ctl, /Остаток ёмкости/);
   assert.match(ctl, /Сбросить счётчики/);
   assert.match(ctl, /Резервная копия настроек/);
   assert.match(ctl, /Не делается в приложении/);
+  assert.doesNotMatch(ctl, /Выключить заряд/, 'ключи теперь на схеме, а не в управлении');
+
+  // блок «Заряд и разряд»: схема и большие кнопки
+  const pw = m.renderPower();
+  assert.match(pw, /ЗАРЯД/);
+  assert.match(pw, /РАЗРЯД/);
+  assert.match(pw, /ВКЛЮЧЕН/);
+  assert.match(pw, /Нажмите, чтобы ВЫКЛЮЧИТЬ/);
+  assert.match(pw, /ключ заряда/);
+  assert.match(pw, /ключ разряда/);
+  assert.match(pw, /АККУМУЛЯТОР/);
+  assert.match(pw, /13\.27 В/);
+  assert.match(pw, /ПЛАТА BMS/);
+  assert.equal((pw.match(/class="sc-cell/g) || []).length, 4, 'по одной полоске на ячейку');
+  assert.match(pw, /aria-label="Схема:/);
+
+  const pwOff = m.renderPowerDischargeOff();
+  assert.match(pwOff, /РАЗРЯД/);
+  assert.match(pwOff, /ВЫКЛЮЧЕН/);
+  assert.match(pwOff, /Нажмите, чтобы ВКЛЮЧИТЬ/);
+  assert.match(pwOff, /порт \/dev\/ttyUSB0/, 'схема показывает выбранный порт');
+
+  const pwOffline = m.renderPowerDisconnected();
+  assert.match(pwOffline, /подключите плату/);
+  assert.match(pwOffline, /нет данных/);
+  assert.match(pwOffline, /class="power-btn[^"]*" disabled=""/, 'кнопки выключены без платы');
 
   const overview = m.renderOverview();
   assert.match(overview, /13\.27/);
@@ -74,4 +99,36 @@ test('экраны рендерятся на данных плате и пока
 
   const empty = m.renderOverviewDisconnected();
   assert.match(empty, /Плата не подключена/);
+
+  // поиск батареи: карточка показывает найденную батарею и причины по остальным портам
+  const scan = m.renderConnectionScan();
+  assert.match(scan, /Найти батарею/);
+  assert.match(scan, /Найдено батарей: 1/);
+  assert.match(scan, /батарея отвечает: 12 ячеек, DEMO JBD 12S/);
+  assert.match(scan, /порт занят или нет доступа/);
+  assert.match(scan, />Подключить</);
+  assert.match(scan, /Как понять, к какому порту подключена батарея/);
+
+  const noAdapter = m.renderConnectionEmpty();
+  assert.match(noAdapter, /Адаптер не найден/);
+  assert.match(m.renderPortHelp(), /Найти батарею/);
+  assert.match(m.renderPortHelp(), /dmesg/);
+
+  // одна страница: ни одной вкладки, все блоки на месте
+  const page = m.renderPage();
+  assert.doesNotMatch(page, /role="tab"/);
+  assert.match(page, /1\. Подключение к батарее/);
+  assert.match(page, /2\. Заряд и разряд/);
+  assert.match(page, /3\. Состояние батареи/);
+  assert.match(page, /4\. Ячейки/);
+  assert.match(page, /5\. Управление/);
+  assert.match(page, /6\. Защиты и настройки платы/);
+  assert.match(page, /7\. Прошивка/);
+
+  // выбор порта: настоящий адаптер вытесняет демо, если пользователь сам его не выбирал
+  assert.equal(m.pick('demo', ['/dev/ttyUSB0'], false), '/dev/ttyUSB0', 'демо не залипает');
+  assert.equal(m.pick('demo', ['/dev/ttyUSB0'], true), 'demo', 'явный выбор демо сохраняется');
+  assert.equal(m.pick('/dev/ttyUSB1', ['/dev/ttyUSB0', '/dev/ttyUSB1'], true), '/dev/ttyUSB1', 'выбранный порт остаётся');
+  assert.equal(m.pick('/dev/ttyUSB1', ['/dev/ttyUSB0'], true), '/dev/ttyUSB0', 'пропавший порт заменяется первым');
+  assert.equal(m.pick('/dev/ttyUSB0', [], false), 'demo', 'портов нет — демо');
 });

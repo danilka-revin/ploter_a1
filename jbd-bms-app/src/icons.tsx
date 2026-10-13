@@ -1,5 +1,5 @@
 // Минималистичные иконки в стиле PSBees (контур 1.8 px, currentColor).
-export function Icon({ name, size = 16 }: { name: 'refresh' | 'download' | 'sun' | 'moon' | 'bolt' | 'shield' | 'check' | 'alert'; size?: number }) {
+export function Icon({ name, size = 16 }: { name: 'refresh' | 'download' | 'sun' | 'moon' | 'bolt' | 'shield' | 'check' | 'alert' | 'power' | 'search' | 'plug'; size?: number }) {
   const common = { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const, 'aria-hidden': true };
   switch (name) {
     case 'refresh':
@@ -18,5 +18,11 @@ export function Icon({ name, size = 16 }: { name: 'refresh' | 'download' | 'sun'
       return <svg {...common}><path d="m5 12 4 4 10-10" /></svg>;
     case 'alert':
       return <svg {...common}><path d="M12 3 2 20h20z" /><path d="M12 10v4M12 17h.01" /></svg>;
+    case 'power':
+      return <svg {...common}><path d="M12 3v8" /><path d="M6.3 6.3a8 8 0 1 0 11.4 0" /></svg>;
+    case 'search':
+      return <svg {...common}><circle cx="11" cy="11" r="6.5" /><path d="m20 20-4.2-4.2" /></svg>;
+    case 'plug':
+      return <svg {...common}><path d="M9 3v5M15 3v5" /><path d="M6 8h12v3a6 6 0 0 1-12 0z" /><path d="M12 17v4" /></svg>;
   }
 }

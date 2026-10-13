@@ -1,31 +1,27 @@
-// Главный экран: шапка (порт, подключение, обновление, тема), вкладки и строка
-// состояния. Данные платы опрашиваются раз в секунду, пока подключено.
+// Единая страница: подключение к батарее → заряд и разряд (схема и большие кнопки) →
+// состояние → ячейки → управление → свёрнутые блоки настроек, прошивки и обновлений.
+// Данные платы опрашиваются раз в секунду, пока подключено. Список портов обновляется сам.
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError, fmtClock, sleep } from './api';
+import { pickPort } from './ports';
 import type {
-  AppState, ConnectResponse, Health, PortItem, PortsResponse, Snapshot, UpdateSnapshot,
+  AppState, ConnectResponse, Health, PortItem, PortsResponse, ScanResponse, Snapshot, UpdateSnapshot,
 } from './types';
+import { ConnectionCard } from './views/Connection';
+import { PowerPanel } from './views/Power';
 import { Overview } from './views/Overview';
 import { Cells } from './views/Cells';
-import { Settings } from './views/Settings';
 import { Control } from './views/Control';
+import { Settings } from './views/Settings';
 import { Firmware } from './views/Firmware';
 import { UpdateDialog } from './views/UpdateDialog';
 import { Icon } from './icons';
 
-type Tab = 'overview' | 'cells' | 'control' | 'settings' | 'firmware';
-
-const TABS: { id: Tab; label: string }[] = [
-  { id: 'overview', label: 'Обзор' },
-  { id: 'cells', label: 'Ячейки' },
-  { id: 'control', label: 'Управление' },
-  { id: 'settings', label: 'Защиты и настройки' },
-  { id: 'firmware', label: 'Прошивка' },
-];
-
 const THEME_KEY = 'jbd.theme';
 const UPDATE_FIRST_MS = 4_000;
 const UPDATE_EVERY_MS = 30 * 60_000;
+const PORTS_EVERY_MS = 2_500;
+const DEMO_LABEL = 'Демо-режим (без платы)';
 
 function initialTheme(): 'dark' | 'light' {
   try {
@@ -37,13 +33,16 @@ function initialTheme(): 'dark' | 'light' {
 
 export default function App() {
   const [theme, setTheme] = useState<'dark' | 'light'>(initialTheme);
-  const [tab, setTab] = useState<Tab>('overview');
 
   const [ports, setPorts] = useState<PortItem[]>([]);
-  const [demoPort, setDemoPort] = useState<PortItem>({ path: 'demo', label: 'Демо-режим (без платы)' });
+  const [demoPort, setDemoPort] = useState<PortItem>({ path: 'demo', label: DEMO_LABEL });
   const [selected, setSelected] = useState('');
+  // выбирал ли пользователь порт сам: если нет, список сам переключает демо на настоящий адаптер
+  const userPicked = useRef(false);
   const [appState, setAppState] = useState<AppState | null>(null);
   const [busy, setBusy] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [scan, setScan] = useState<ScanResponse | null>(null);
   const [notice, setNotice] = useState<{ kind: 'err' | 'ok'; text: string } | null>(null);
 
   const [snap, setSnap] = useState<Snapshot | null>(null);
@@ -62,14 +61,14 @@ export default function App() {
   }, [theme]);
 
   // ----- порты и состояние -----
-  const refreshPorts = useCallback(async () => {
+  const refreshPorts = useCallback(async (quiet = false) => {
     try {
       const r = await api<PortsResponse>('/api/ports');
       setPorts(r.ports);
       setDemoPort(r.demo);
-      setSelected((cur) => cur || r.ports[0]?.path || r.demo.path);
+      setSelected((cur) => pickPort(cur, r, userPicked.current));
     } catch (e: any) {
-      setNotice({ kind: 'err', text: e.message });
+      if (!quiet) setNotice({ kind: 'err', text: e.message });
     }
   }, []);
 
@@ -87,20 +86,29 @@ export default function App() {
     refreshState();
   }, [refreshPorts, refreshState]);
 
+  const connected = Boolean(appState?.connected);
+
+  // пока плата не подключена, список портов обновляется сам: вставили адаптер — он появился
+  useEffect(() => {
+    if (connected) return;
+    const id = setInterval(() => refreshPorts(true), PORTS_EVERY_MS);
+    return () => clearInterval(id);
+  }, [connected, refreshPorts]);
+
   // ----- подключение -----
-  const connect = async () => {
+  const connectTo = useCallback(async (path: string) => {
     setBusy(true);
     setNotice(null);
     try {
       const r = await api<ConnectResponse>('/api/connect', {
         method: 'POST',
-        body: JSON.stringify({ path: selected }),
+        body: JSON.stringify({ path }),
       }, 20_000);
       setNotice({
         kind: 'ok',
         text: r.demo
           ? 'Демо-режим: данные эмулятора, плата не нужна.'
-          : `Подключено: ${r.deviceName || 'BMS'}, ячеек: ${r.cellCount}.`,
+          : `Батарея подключена на порту ${path}: ${r.deviceName || 'BMS'}, ячеек: ${r.cellCount}.`,
       });
       setPollError('');
       await refreshState();
@@ -110,7 +118,9 @@ export default function App() {
     } finally {
       setBusy(false);
     }
-  };
+  }, [refreshState]);
+
+  const connect = () => connectTo(selected);
 
   const disconnect = async () => {
     setBusy(true);
@@ -123,8 +133,39 @@ export default function App() {
     }
   };
 
+  // ----- поиск батареи по всем портам -----
+  const findBattery = async () => {
+    setScanning(true);
+    setNotice(null);
+    setScan(null);
+    try {
+      const r = await api<ScanResponse>('/api/scan', { method: 'POST' }, 90_000);
+      setScan(r);
+      if (r.found.length === 0) {
+        setNotice({
+          kind: 'err',
+          text: r.results.length === 0
+            ? 'USB–UART адаптер не найден. Вставьте его и нажмите «Найти батарею» ещё раз.'
+            : 'Батарея не найдена ни на одном порту. Смотрите причины ниже.',
+        });
+      } else if (r.found.length === 1) {
+        userPicked.current = true;
+        setSelected(r.found[0]);
+        await connectTo(r.found[0]);
+      } else {
+        userPicked.current = true;
+        setSelected(r.found[0]);
+        setNotice({ kind: 'ok', text: `Нашлось несколько батарей: ${r.found.join(', ')}. Выберите нужную кнопкой «Подключить» ниже.` });
+      }
+    } catch (e: any) {
+      setNotice({ kind: 'err', text: e.message });
+    } finally {
+      setScanning(false);
+      await refreshPorts(true);
+    }
+  };
+
   // ----- опрос платы -----
-  const connected = Boolean(appState?.connected);
   useEffect(() => {
     if (!connected) { setSnap(null); return; }
     let alive = true;
@@ -198,6 +239,7 @@ export default function App() {
   }, [update?.phase, update?.running]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const updateAvailable = Boolean(update?.updateAvailable);
+  const b = snap?.basic;
 
   return (
     <div className="app">
@@ -206,35 +248,19 @@ export default function App() {
           <span className="brandmark"><img src="logo.png" alt="" /></span>
           <span className="brandtext">
             <b>JBD <em>BMS</em></b>
-            <small>ЧТЕНИЕ И ПРОШИВКА · UART</small>
+            <small>ЧТЕНИЕ И УПРАВЛЕНИЕ · UART</small>
           </span>
         </div>
 
-        <div className="tb-group port-group">
-          <select
-            className="port-select"
-            value={selected}
-            onChange={(e) => setSelected(e.target.value)}
-            disabled={busy || connected}
-            aria-label="Порт"
-          >
-            {ports.length === 0 && <option value="">Порты не найдены</option>}
-            {ports.map((p) => <option key={p.path} value={p.path}>{p.label}</option>)}
-            <option value={demoPort.path}>{demoPort.label}</option>
-          </select>
-          <button className="tb-btn" title="Обновить список портов" onClick={refreshPorts} disabled={busy || connected}>
-            <Icon name="refresh" />
-          </button>
-          {connected ? (
-            <button className="btn" onClick={disconnect} disabled={busy}>Отключить</button>
+        <div className="tb-status">
+          {connected && b ? (
+            <span className="pill on"><span className="pulse" /> {b.packVoltage.toFixed(2)} В · {b.capacityPct}%</span>
           ) : (
-            <button className="btn primary" onClick={connect} disabled={busy || !selected}>
-              {busy ? 'Подключаю…' : 'Подключить'}
-            </button>
+            <span className="pill off"><span className="dot-off" /> не подключено</span>
           )}
         </div>
 
-        <div className="tb-group toolbar-exit">
+        <div className="toolbar-exit">
           <button
             className={`tb-btn wide upd-btn ${updateAvailable ? 'upd-avail' : ''}`}
             onClick={() => setUpdOpen(true)}
@@ -254,33 +280,68 @@ export default function App() {
         </div>
       </header>
 
-      <nav className="tabs" role="tablist">
-        {TABS.map((t) => (
-          <button
-            key={t.id}
-            role="tab"
-            aria-selected={tab === t.id}
-            className={tab === t.id ? 'on' : ''}
-            onClick={() => setTab(t.id)}
-          >
-            {t.label}
-          </button>
-        ))}
-      </nav>
-
       {notice && (
-        <div className={`banner ${notice.kind}`} role="status">
+        <div className={`banner ${notice.kind} page-banner`} role="status">
           <span>{notice.text}</span>
           <button className="btn tiny" onClick={() => setNotice(null)}>Закрыть</button>
         </div>
       )}
 
-      <main className="content">
-        {tab === 'overview' && <Overview snap={snap} connected={connected} error={pollError} />}
-        {tab === 'cells' && <Cells snap={snap} connected={connected} error={pollError} />}
-        {tab === 'control' && <Control snap={snap} connected={connected} />}
-        {tab === 'settings' && <Settings connected={connected} />}
-        {tab === 'firmware' && <Firmware connected={connected} snap={snap} onStateChange={refreshState} />}
+      <main className="page">
+        <ConnectionCard
+          ports={ports}
+          demoPort={demoPort}
+          selected={selected}
+          onSelect={(path) => { userPicked.current = true; setSelected(path); }}
+          onRefresh={() => refreshPorts()}
+          connected={connected}
+          busy={busy}
+          scanning={scanning}
+          scan={scan}
+          portName={appState?.port ?? null}
+          demo={Boolean(appState?.demo)}
+          deviceName={appState?.deviceName ?? ''}
+          onConnect={connect}
+          onDisconnect={disconnect}
+          onFind={findBattery}
+          onConnectPath={connectTo}
+        />
+
+        <PowerPanel
+          snap={snap}
+          connected={connected}
+          port={appState?.port ?? null}
+          demo={Boolean(appState?.demo)}
+        />
+
+        <section className="block" aria-labelledby="state-title">
+          <div className="sec-head"><h2 id="state-title">3. Состояние батареи</h2></div>
+          <Overview snap={snap} connected={connected} error={pollError} />
+        </section>
+
+        <section className="block" aria-labelledby="cells-title">
+          <div className="sec-head"><h2 id="cells-title">4. Ячейки</h2></div>
+          <Cells snap={snap} connected={connected} error={pollError} />
+        </section>
+
+        <section className="block" aria-labelledby="ctl-title">
+          <div className="sec-head"><h2 id="ctl-title">5. Управление</h2></div>
+          <Control snap={snap} connected={connected} />
+        </section>
+
+        <details className="block fold">
+          <summary><span className="fold-title">6. Защиты и настройки платы</span><span className="muted small">читать и менять пороги (нужна осторожность)</span></summary>
+          <div className="fold-body">
+            <Settings connected={connected} />
+          </div>
+        </details>
+
+        <details className="block fold">
+          <summary><span className="fold-title">7. Прошивка</span><span className="muted small">проверка файла .hex</span></summary>
+          <div className="fold-body">
+            <Firmware connected={connected} snap={snap} onStateChange={refreshState} />
+          </div>
+        </details>
       </main>
 
       <footer className="status">

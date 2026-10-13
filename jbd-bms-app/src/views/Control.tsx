@@ -15,13 +15,14 @@ const ERROR_LABELS: Record<string, string> = {
 interface Pending { id: string; title: string; text: string; run: () => Promise<void> }
 interface Msg { ok: boolean; text: string }
 
+/** Управление: остаток ёмкости, счётчики, резервная копия. Ключи заряда — на схеме (PowerPanel). */
 export function Control({ snap, connected }: { snap: Snapshot | null; connected: boolean }) {
   const [pending, setPending] = useState<Pending | null>(null);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<Record<string, Msg>>({});
   const [ah, setAh] = useState('');
 
-  if (!connected) return <Empty title="Плата не подключена">Управление доступно только при подключённой плате.</Empty>;
+  if (!connected) return <Empty title="Плата не подключена">Остаток ёмкости, счётчики и резервная копия доступны только при подключённой плате.</Empty>;
   if (!snap) return <Empty title="Читаю состояние…">Запрос к BMS…</Empty>;
 
   const b = snap.basic;
@@ -38,42 +39,8 @@ export function Control({ snap, connected }: { snap: Snapshot | null; connected:
     }
   };
 
-  const setFet = (charge: boolean, discharge: boolean, id: string, title: string, text: string) =>
-    setPending({
-      id, title, text,
-      run: async () => {
-        const r = await api<{ ok: boolean; message: string }>('/api/control/fet', {
-          method: 'POST', body: JSON.stringify({ confirm: true, charge, discharge }),
-        }, 30_000);
-        setMsg((m) => ({ ...m, [id]: { ok: r.ok, text: r.message } }));
-      },
-    });
-
-  const fetLabel = (on: boolean) => (on ? 'включён' : 'выключен');
-
   return (
     <div className="ctl-grid">
-      <section className="card ctl-card">
-        <h3>Ключи заряда и разряда</h3>
-        <div className="ctl-state">
-          <span className={`ctl-pill ${b.chargeFetOn ? 'on' : 'off'}`}>Заряд: {fetLabel(b.chargeFetOn)}</span>
-          <span className={`ctl-pill ${b.dischargeFetOn ? 'on' : 'off'}`}>Разряд: {fetLabel(b.dischargeFetOn)}</span>
-        </div>
-        <div className="ctl-row">
-          <button className="btn" disabled={busy} onClick={() => setFet(!b.chargeFetOn, b.dischargeFetOn, 'fet', b.chargeFetOn ? 'Выключить заряд' : 'Включить заряд',
-            b.chargeFetOn ? 'Зарядка батареи остановится. Нагрузка будет питаться от батареи.' : 'Зарядка батареи разрешится.')}>
-            {b.chargeFetOn ? 'Выключить заряд' : 'Включить заряд'}
-          </button>
-          <button className="btn" disabled={busy} onClick={() => setFet(b.chargeFetOn, !b.dischargeFetOn, 'fet', b.dischargeFetOn ? 'Выключить разряд' : 'Включить разряд',
-            b.dischargeFetOn ? 'Батарея перестанет отдавать ток. Нагрузка отключится от батареи.' : 'Разряд батареи разрешится.')}>
-            {b.dischargeFetOn ? 'Выключить разряд' : 'Включить разряд'}
-          </button>
-        </div>
-        <p className="muted small">Не сохраняется в память платы: после выключения платы ключи снова включаются.</p>
-        <Confirm pending={pending} id="fet" busy={busy} onCancel={() => setPending(null)} onRun={runAction} />
-        <Result m={msg.fet} />
-      </section>
-
       <section className="card ctl-card">
         <h3>Остаток ёмкости</h3>
         <div className="ctl-state small muted">

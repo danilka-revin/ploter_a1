@@ -8,7 +8,7 @@ const HI = 3650;
 const DELTA_WARN_MV = 30;
 
 export function Cells({ snap, connected, error }: { snap: Snapshot | null; connected: boolean; error: string }) {
-  if (!connected) return <Empty title="Плата не подключена">Подключите BMS на вкладке «Обзор».</Empty>;
+  if (!connected) return <Empty title="Плата не подключена">Подключите батарею в блоке «Подключение к батарее» (вверху страницы).</Empty>;
   if (!snap) return <Empty title="Читаю ячейки…">{error ? `Ошибка: ${error}` : 'Запрос к BMS…'}</Empty>;
 
   const cells = snap.cells.values;
