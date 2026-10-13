@@ -1,374 +1,251 @@
-// Единая страница: подключение к батарее → заряд и разряд (схема и большие кнопки) →
-// состояние → ячейки → управление → свёрнутые блоки настроек, прошивки и обновлений.
-// Данные платы опрашиваются раз в секунду, пока подключено. Список портов обновляется сам.
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { api, ApiError, fmtClock, sleep } from './api';
-import { pickPort } from './ports';
-import type {
-  AppState, ConnectResponse, Health, PortItem, PortsResponse, ScanResponse, Snapshot, UpdateSnapshot,
-} from './types';
-import { ConnectionCard } from './views/Connection';
-import { PowerPanel } from './views/Power';
-import { Overview } from './views/Overview';
-import { Cells } from './views/Cells';
-import { Control } from './views/Control';
-import { Settings } from './views/Settings';
-import { Firmware } from './views/Firmware';
+// Большая панель BMS: один экран, без прокрутки страницы.
+//
+//  • сверху — строка состояния парка (В, А, Вт, SOC, защиты) и настройки опроса;
+//  • «Отчёт по всем банкам» — таблица со всеми ключевыми числами и мини-графиком на строку;
+//  • графики (напряжение/ток, мощность, температуры, разброс ячеек и заряд) по выбранному
+//    банку или по парку целиком;
+//  • справа — плитка «Плата: все данные и настройки» (читаем 0x00…0xFF и пишем EEPROM);
+//  • снизу — управление (ключи, балансировка, остаток, сбросы) и консоль сырых регистров;
+//  • журнал событий — в нижней строке, открывается по клику.
+//
+// Страница не скроллится: плитки прокручиваются внутри себя. Клавиши: F — полный экран,
+// D — демо-банки, S — найти все платы, 1…9 — выбрать банк, J — журнал, Esc — закрыть.
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { api } from './api';
+import { useCockpit } from './store';
+import { Tile, Btn, Chip, num } from './views/Tile';
+import { BankTable, C, Charts, ConnectTile, KpiStrip } from './views/Report';
+import { ControlTile, ConsoleTile, Journal } from './views/Ops';
+import { DataTile } from './views/Editor';
 import { UpdateDialog } from './views/UpdateDialog';
 import { Icon } from './icons';
+import type { Health, UpdateSnapshot } from './types';
 
 const THEME_KEY = 'jbd.theme';
+const DENSITY_KEY = 'jbd.density';
 const UPDATE_FIRST_MS = 4_000;
 const UPDATE_EVERY_MS = 30 * 60_000;
-const PORTS_EVERY_MS = 2_500;
-const DEMO_LABEL = 'Демо-режим (без платы)';
+const FLEET = '__fleet__';
 
-function initialTheme(): 'dark' | 'light' {
-  try {
-    const s = globalThis.localStorage?.getItem(THEME_KEY);
-    if (s === 'light' || s === 'dark') return s;
-  } catch { /* приватный режим */ }
-  return 'dark';
+function read(key: string, dflt: string) {
+  try { return globalThis.localStorage?.getItem(key) ?? dflt; } catch { return dflt; }
 }
 
 export default function App() {
-  const [theme, setTheme] = useState<'dark' | 'light'>(initialTheme);
-
-  const [ports, setPorts] = useState<PortItem[]>([]);
-  const [demoPort, setDemoPort] = useState<PortItem>({ path: 'demo', label: DEMO_LABEL });
-  const [selected, setSelected] = useState('');
-  // выбирал ли пользователь порт сам: если нет, список сам переключает демо на настоящий адаптер
-  const userPicked = useRef(false);
-  const [appState, setAppState] = useState<AppState | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [scanning, setScanning] = useState(false);
-  const [scan, setScan] = useState<ScanResponse | null>(null);
-  const [notice, setNotice] = useState<{ kind: 'err' | 'ok'; text: string } | null>(null);
-
-  const [snap, setSnap] = useState<Snapshot | null>(null);
-  const [pollError, setPollError] = useState('');
-  const [lastOkAt, setLastOkAt] = useState(0);
-  const inFlight = useRef(false);
-
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => (read(THEME_KEY, 'dark') === 'light' ? 'light' : 'dark'));
+  const [density, setDensity] = useState<'compact' | 'roomy'>(() => (read(DENSITY_KEY, 'compact') === 'roomy' ? 'roomy' : 'compact'));
+  const [journalOpen, setJournalOpen] = useState(false);
   const [health, setHealth] = useState<Health | null>(null);
   const [update, setUpdate] = useState<UpdateSnapshot | null>(null);
   const [updOpen, setUpdOpen] = useState(false);
 
-  // ----- тема -----
+  const cockpit = useCockpit();
+  const { panel, catalog, focus, focusBank, series, registers } = cockpit;
+  const banks = panel?.banks ?? [];
+  const fleet = panel?.fleet;
+  const isFleet = focus === FLEET || (!focus && banks.length > 1);
+
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     try { globalThis.localStorage?.setItem(THEME_KEY, theme); } catch { /* ignore */ }
   }, [theme]);
 
-  // ----- порты и состояние -----
-  const refreshPorts = useCallback(async (quiet = false) => {
-    try {
-      const r = await api<PortsResponse>('/api/ports');
-      setPorts(r.ports);
-      setDemoPort(r.demo);
-      setSelected((cur) => pickPort(cur, r, userPicked.current));
-    } catch (e: any) {
-      if (!quiet) setNotice({ kind: 'err', text: e.message });
-    }
-  }, []);
-
-  const refreshState = useCallback(async () => {
-    try {
-      setAppState(await api<AppState>('/api/state'));
-    } catch (e: any) {
-      setNotice({ kind: 'err', text: e.message });
-    }
-  }, []);
-
   useEffect(() => {
-    api<Health>('/healthz').then(setHealth).catch(() => {});
-    refreshPorts();
-    refreshState();
-  }, [refreshPorts, refreshState]);
+    document.documentElement.dataset.density = density;
+    try { globalThis.localStorage?.setItem(DENSITY_KEY, density); } catch { /* ignore */ }
+  }, [density]);
 
-  const connected = Boolean(appState?.connected);
+  useEffect(() => { api<Health>('/healthz').then(setHealth).catch(() => {}); }, []);
 
-  // пока плата не подключена, список портов обновляется сам: вставили адаптер — он появился
-  useEffect(() => {
-    if (connected) return;
-    const id = setInterval(() => refreshPorts(true), PORTS_EVERY_MS);
-    return () => clearInterval(id);
-  }, [connected, refreshPorts]);
-
-  // ----- подключение -----
-  const connectTo = useCallback(async (path: string) => {
-    setBusy(true);
-    setNotice(null);
-    try {
-      const r = await api<ConnectResponse>('/api/connect', {
-        method: 'POST',
-        body: JSON.stringify({ path }),
-      }, 20_000);
-      setNotice({
-        kind: 'ok',
-        text: r.demo
-          ? 'Демо-режим: данные эмулятора, плата не нужна.'
-          : `Батарея подключена на порту ${path}: ${r.deviceName || 'BMS'}, ячеек: ${r.cellCount}.`,
-      });
-      setPollError('');
-      await refreshState();
-    } catch (e: any) {
-      setNotice({ kind: 'err', text: e.message });
-      await refreshState();
-    } finally {
-      setBusy(false);
-    }
-  }, [refreshState]);
-
-  const connect = () => connectTo(selected);
-
-  const disconnect = async () => {
-    setBusy(true);
-    try {
-      await api('/api/disconnect', { method: 'POST' });
-    } finally {
-      setSnap(null);
-      setBusy(false);
-      await refreshState();
-    }
-  };
-
-  // ----- поиск батареи по всем портам -----
-  const findBattery = async () => {
-    setScanning(true);
-    setNotice(null);
-    setScan(null);
-    try {
-      const r = await api<ScanResponse>('/api/scan', { method: 'POST' }, 90_000);
-      setScan(r);
-      if (r.found.length === 0) {
-        setNotice({
-          kind: 'err',
-          text: r.results.length === 0
-            ? 'USB–UART адаптер не найден. Вставьте его и нажмите «Найти батарею» ещё раз.'
-            : 'Батарея не найдена ни на одном порту. Смотрите причины ниже.',
-        });
-      } else if (r.found.length === 1) {
-        userPicked.current = true;
-        setSelected(r.found[0]);
-        await connectTo(r.found[0]);
-      } else {
-        userPicked.current = true;
-        setSelected(r.found[0]);
-        setNotice({ kind: 'ok', text: `Нашлось несколько батарей: ${r.found.join(', ')}. Выберите нужную кнопкой «Подключить» ниже.` });
-      }
-    } catch (e: any) {
-      setNotice({ kind: 'err', text: e.message });
-    } finally {
-      setScanning(false);
-      await refreshPorts(true);
-    }
-  };
-
-  // ----- опрос платы -----
-  useEffect(() => {
-    if (!connected) { setSnap(null); return; }
-    let alive = true;
-    const tick = async () => {
-      if (inFlight.current) return;
-      inFlight.current = true;
-      try {
-        const s = await api<Snapshot>('/api/snapshot', {}, 6_000);
-        if (!alive) return;
-        setSnap(s);
-        setPollError('');
-        setLastOkAt(Date.now());
-      } catch (e: any) {
-        if (!alive) return;
-        setPollError(e.message);
-        if (e instanceof ApiError && e.status === 502) refreshState();
-      } finally {
-        inFlight.current = false;
-      }
-    };
-    tick();
-    const id = setInterval(tick, 1000);
-    return () => { alive = false; clearInterval(id); };
-  }, [connected, refreshState]);
-
-  // ----- обновления -----
   const checkUpdate = useCallback(async () => {
-    try {
-      setUpdate(await api<UpdateSnapshot>('/update/check', {}, 20_000));
-    } catch { /* сервер недоступен — тихо */ }
+    try { setUpdate(await api<UpdateSnapshot>('/update/check', {}, 20_000)); } catch { /* сервер не отвечает */ }
   }, []);
-
   useEffect(() => {
     const first = setTimeout(checkUpdate, UPDATE_FIRST_MS);
     const every = setInterval(checkUpdate, UPDATE_EVERY_MS);
     return () => { clearTimeout(first); clearInterval(every); };
   }, [checkUpdate]);
-
-  const runUpdate = async () => {
-    try {
-      setUpdate(await api<UpdateSnapshot>('/update/run', { method: 'POST' }));
-    } catch (e: any) {
-      setNotice({ kind: 'err', text: e.message });
-    }
-  };
-
-  // после установки сервер перезапускается: ждём его и перезагружаем страницу
-  useEffect(() => {
-    if (!update || !update.restartRequired) return;
-    let stop = false;
-    (async () => {
-      await sleep(2500);
-      for (let i = 0; i < 90 && !stop; i++) {
-        try {
-          const h = await api<Health>('/healthz', {}, 2_000);
-          if (h.ok) { location.reload(); return; }
-        } catch { /* ещё перезапускается */ }
-        await sleep(1000);
-      }
-    })();
-    return () => { stop = true; };
-  }, [update?.restartRequired]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // опрос хода обновления, пока оно идёт
+  const runUpdate = useCallback(async () => {
+    try { setUpdate(await api<UpdateSnapshot>('/update/run', { method: 'POST' })); } catch { /* причина в журнале */ }
+  }, []);
   useEffect(() => {
     if (!update || (update.phase !== 'running' && !update.running)) return;
     const id = setInterval(async () => {
-      try { setUpdate(await api<UpdateSnapshot>('/update/status')); } catch { /* перезапуск */ }
+      try { setUpdate(await api<UpdateSnapshot>('/update/status')); } catch { /* идёт перезапуск сервера */ }
     }, 1000);
     return () => clearInterval(id);
   }, [update?.phase, update?.running]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (!update?.restartRequired) return;
+    let stop = false;
+    const wait = async () => {
+      for (let i = 0; i < 60 && !stop; i++) {
+        await new Promise((r) => setTimeout(r, 1000));
+        try { const h = await api<Health>('/healthz', {}, 1500); if (h.ok) { location.reload(); return; } } catch { /* ждём */ }
+      }
+    };
+    wait();
+    return () => { stop = true; };
+  }, [update?.restartRequired]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const updateAvailable = Boolean(update?.updateAvailable);
-  const b = snap?.basic;
+  // ----- горячие клавиши -----
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const el = e.target as HTMLElement | null;
+      if (el && /input|select|textarea/i.test(el.tagName)) return;
+      if (e.key === 'Escape') { setJournalOpen(false); return; }
+      const k = e.key.toLowerCase();
+      if (k === 'f' || e.key === 'F11') {
+        e.preventDefault();
+        if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+        else document.documentElement.requestFullscreen?.().catch(() => {});
+      } else if (k === 'd') cockpit.addDemo();
+      else if (k === 's') cockpit.findAndConnectAll();
+      else if (k === 'j') setJournalOpen((v) => !v);
+      else if (/^[1-9]$/.test(e.key)) {
+        const bank = banks[Number(e.key) - 1];
+        if (bank) cockpit.setFocus(bank.id);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [banks, cockpit]);
+
+  const faultLabels = useMemo(() => Object.fromEntries((catalog?.faults ?? []).map((f) => [f.key, f.label])), [catalog]);
+  const alertCount = (fleet?.faults ?? 0) + banks.filter((b) => !b.connected).length;
+  const lastMsg = cockpit.log[0];
 
   return (
-    <div className="app">
-      <header className="toolbar">
-        <div className="brand">
-          <span className="brandmark"><img src="logo.png" alt="" /></span>
-          <span className="brandtext">
-            <b>JBD <em>BMS</em></b>
-            <small>ЧТЕНИЕ И УПРАВЛЕНИЕ · UART</small>
+    <div className="dash" data-alert={alertCount > 0 ? '1' : '0'}>
+      <header className="bar" data-area="bar">
+        <div className="brand" title="JBD / Xiaoxiang BMS · UART 9600 8N1">
+          <img src="logo.png" alt="" />
+          <b>JBD <em>BMS</em> <span>PANEL</span></b>
+        </div>
+
+        <div className="bar-kpis">
+          <span className="bk"><i>банков</i><b>{fleet ? `${fleet.online}/${fleet.banks}` : '0/0'}</b></span>
+          <span className="bk"><i>суммарно</i><b>{num(fleet?.currentSum ?? null, 1)} А · {num(fleet?.powerSum ?? null, 0)} Вт</b></span>
+          <span className="bk"><i>среднее</i><b>{num(fleet?.voltageAvg ?? null, 2)} В · {num(fleet?.socAvg ?? null, 0)}%</b></span>
+          <span className="bk"><i>разброс</i><b className={(fleet?.cellDelta ?? 0) > 30 ? 'warn' : ''}>{fleet?.cellDelta ?? '—'} мВ</b></span>
+          <span className="bk"><i>T макс</i><b>{num(fleet?.tempMax ?? null, 1)} °C</b></span>
+          <span className={`bk ${alertCount ? 'bad' : 'ok'}`}><i>защиты</i><b>{fleet?.faults ?? 0}</b></span>
+        </div>
+
+        <div className="bar-tools">
+          <span className="seg" title="окно графиков">
+            {cockpit.WINDOW_OPTIONS.map((sec: number) => (
+              <button key={sec} className={cockpit.windowSec === sec ? 'on' : ''} onClick={() => cockpit.setWindowSec(sec)}>{Math.round(sec / 60)}м</button>
+            ))}
           </span>
-        </div>
-
-        <div className="tb-status">
-          {connected && b ? (
-            <span className="pill on"><span className="pulse" /> {b.packVoltage.toFixed(2)} В · {b.capacityPct}%</span>
-          ) : (
-            <span className="pill off"><span className="dot-off" /> не подключено</span>
-          )}
-        </div>
-
-        <div className="toolbar-exit">
-          <button
-            className={`tb-btn wide upd-btn ${updateAvailable ? 'upd-avail' : ''}`}
-            onClick={() => setUpdOpen(true)}
-            title={updateAvailable ? 'Есть новая версия на GitHub' : 'Проверка обновлений'}
-          >
-            {updateAvailable && <span className="upd-dot is-new" />}
-            <Icon name="download" />
-            <span>{updateAvailable ? 'Обновить с main' : 'Обновления'}</span>
-          </button>
-          <button
-            className="tb-btn"
-            title={theme === 'dark' ? 'Светлая тема' : 'Тёмная тема'}
-            onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
-          >
-            <Icon name={theme === 'dark' ? 'sun' : 'moon'} />
-          </button>
+          <span className="seg" title="период опроса плат">
+            {[500, 1000, 2000, 5000].map((ms) => (
+              <button key={ms} className={cockpit.pollMs === ms ? 'on' : ''} onClick={() => cockpit.setRate(ms)} title={`опрос каждые ${ms} мс`}>{ms < 1000 ? `0,${Math.round(ms / 100)}с` : `${ms / 1000}с`}</button>
+            ))}
+          </span>
+          <Btn small onClick={cockpit.exportCsv} title="Отчёт по всем банкам в CSV">CSV отчёт</Btn>
+          <Btn small onClick={cockpit.exportJson} title="Полный отчёт (все регистры) в JSON">JSON</Btn>
+          <button className="ic" onClick={() => setDensity(density === 'compact' ? 'roomy' : 'compact')} title="Плотность панели">{density === 'compact' ? '⤡' : '⤢'}</button>
+          <button className="ic" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')} title="Тема">{theme === 'dark' ? '☀' : '☾'}</button>
+          <button className="ic" onClick={() => document.documentElement.requestFullscreen?.().catch(() => {})} title="Полный экран (F)">⛶</button>
+          <button className={`ic upd ${update?.updateAvailable ? 'new' : ''}`} onClick={() => setUpdOpen(true)} title="Обновления с GitHub"><Icon name="download" size={14} /></button>
         </div>
       </header>
 
-      {notice && (
-        <div className={`banner ${notice.kind} page-banner`} role="status">
-          <span>{notice.text}</span>
-          <button className="btn tiny" onClick={() => setNotice(null)}>Закрыть</button>
+      <Tile
+        title="Отчёт по всем банкам" area="rep"
+        hint={banks.length ? `${banks.length} плат(ы) · клик по строке — выбрать банк · двойной клик по имени — переименовать` : 'нет подключённых банков'}
+        tools={<Btn small onClick={() => cockpit.refresh(focus)} title="Обновить данные сейчас">↻</Btn>}
+      >
+        <BankTable
+          banks={banks} focus={focus}
+          faultLabels={faultLabels}
+          onFocus={(id) => cockpit.setFocus(id === focus ? FLEET : id)}
+          onRename={cockpit.renameBank}
+          onReconnect={cockpit.reconnectBank}
+          onRemove={cockpit.removeBank}
+        />
+      </Tile>
+
+      <Tile title="Порты и подключение" area="cnc" hint="USB–UART 9600 8N1">
+        <ConnectTile
+          ports={cockpit.ports} selected={cockpit.selected} onSelect={cockpit.setSelected}
+          onConnect={() => cockpit.addBank(cockpit.selected)}
+          onFind={cockpit.findAndConnectAll}
+          onDemo={cockpit.addDemo}
+          busy={cockpit.busy} scanning={cockpit.scanning}
+          banks={banks} catalog={catalog}
+        />
+      </Tile>
+
+      <Tile
+        title="Графики" area="cht"
+        hint={`окно ${Math.round(cockpit.windowSec / 60)} мин · курсор по графику показывает значения`}
+        tools={
+          <span className="chips">
+            <Chip on={isFleet} onClick={() => cockpit.setFocus(FLEET)} title="сводка по всему парку">весь парк</Chip>
+            {banks.map((b) => (
+              <Chip key={b.id} on={focus === b.id && !isFleet} onClick={() => cockpit.setFocus(b.id)} title={`${b.path} · ${b.deviceName}`}>
+                <i className="dot" style={{ background: b.connected ? C.soc : C.bad }} />{b.label}
+              </Chip>
+            ))}
+          </span>
+        }
+      >
+        <KpiStrip panel={panel} bank={isFleet ? null : focusBank} series={series} isFleet={isFleet || !focusBank} />
+        <Charts series={series} bank={isFleet ? banks[0] ?? null : focusBank} catalog={catalog} registers={registers} />
+      </Tile>
+
+      <Tile
+        title="Плата: все данные и настройки" area="dat"
+        hint={focusBank ? `банк ${focusBank.label}${registers ? ` · ${registers.settings.length} регистров` : ''}` : 'банк не выбран'}
+      >
+        <DataTile
+          registers={registers} catalog={catalog} busy={cockpit.busy}
+          bankName={focusBank?.label ?? ''}
+          onRead={() => cockpit.readRegisters(focusBank?.id ?? null)}
+          onWrite={cockpit.writeSettings}
+        />
+      </Tile>
+
+      <Tile title="Управление" area="ctl" hint="все команды требуют подтверждения вторым нажатием">
+        <ControlTile
+          bank={focusBank} busy={cockpit.busy} control={cockpit.control} catalog={catalog}
+          onBackup={cockpit.backup} onRestore={cockpit.restore} panel={panel}
+        />
+      </Tile>
+
+      <Tile title="Консоль регистров" area="con" hint="читать и писать любой регистр 0x00–0xFF">
+        <ConsoleTile
+          catalog={catalog} bank={focusBank} busy={cockpit.busy}
+          rawRead={(regs) => cockpit.rawRead(regs, focusBank?.id)}
+          rawWrite={cockpit.rawWrite}
+        />
+      </Tile>
+
+      <footer className="bar foot" data-area="foot" onClick={() => setJournalOpen(true)} role="button" tabIndex={0}>
+        <span className={`pulse-dot ${banks.some((b) => b.connected) ? 'on' : ''}`} />
+        <span>{banks.length ? `опрос ${Math.round(cockpit.pollMs / 1000 * 10) / 10} с · обновлено ${panel?.at ? new Date(panel.at).toLocaleTimeString('ru-RU') : '—'}` : 'плат нет · «Демо-банки» или «Найти и подключить все»'}</span>
+        {cockpit.error ? <span className="err-line">{cockpit.error}</span> : lastMsg ? <span className="muted">{new Date(lastMsg.at).toLocaleTimeString('ru-RU')} · {lastMsg.text}</span> : null}
+        <span className="sp" />
+        {update?.updateAvailable && <button className="linkish" onClick={(e) => { e.stopPropagation(); setUpdOpen(true); }}>есть обновление</button>}
+        <span className="muted">журнал (J) · F — полный экран · 1…9 — банк</span>
+        <span className="muted">v{health?.app ?? '—'}{health?.commit ? ` · ${health.commit}` : ''}</span>
+      </footer>
+
+      {journalOpen && (
+        <div className="veil" onClick={() => setJournalOpen(false)}>
+          <div className="sheet" onClick={(e) => e.stopPropagation()}>
+            <h3>Журнал панели</h3>
+            <Journal log={cockpit.log} error={cockpit.error} />
+            <div className="modal-actions"><Btn onClick={() => setJournalOpen(false)}>Закрыть</Btn></div>
+          </div>
         </div>
       )}
 
-      <main className="page">
-        <ConnectionCard
-          ports={ports}
-          demoPort={demoPort}
-          selected={selected}
-          onSelect={(path) => { userPicked.current = true; setSelected(path); }}
-          onRefresh={() => refreshPorts()}
-          connected={connected}
-          busy={busy}
-          scanning={scanning}
-          scan={scan}
-          portName={appState?.port ?? null}
-          demo={Boolean(appState?.demo)}
-          deviceName={appState?.deviceName ?? ''}
-          onConnect={connect}
-          onDisconnect={disconnect}
-          onFind={findBattery}
-          onConnectPath={connectTo}
-        />
-
-        <PowerPanel
-          snap={snap}
-          connected={connected}
-          port={appState?.port ?? null}
-          demo={Boolean(appState?.demo)}
-        />
-
-        <section className="block" aria-labelledby="state-title">
-          <div className="sec-head"><h2 id="state-title">3. Состояние батареи</h2></div>
-          <Overview snap={snap} connected={connected} error={pollError} />
-        </section>
-
-        <section className="block" aria-labelledby="cells-title">
-          <div className="sec-head"><h2 id="cells-title">4. Ячейки</h2></div>
-          <Cells snap={snap} connected={connected} error={pollError} />
-        </section>
-
-        <section className="block" aria-labelledby="ctl-title">
-          <div className="sec-head"><h2 id="ctl-title">5. Управление</h2></div>
-          <Control snap={snap} connected={connected} />
-        </section>
-
-        <details className="block fold">
-          <summary><span className="fold-title">6. Защиты и настройки платы</span><span className="muted small">читать и менять пороги (нужна осторожность)</span></summary>
-          <div className="fold-body">
-            <Settings connected={connected} />
-          </div>
-        </details>
-
-        <details className="block fold">
-          <summary><span className="fold-title">7. Прошивка</span><span className="muted small">проверка файла .hex</span></summary>
-          <div className="fold-body">
-            <Firmware connected={connected} snap={snap} onStateChange={refreshState} />
-          </div>
-        </details>
-      </main>
-
-      <footer className="status">
-        <span className="lg">
-          <span className={connected ? 'pulse' : 'dot-off'} />
-          {connected
-            ? (appState?.demo ? 'Демо-режим' : `Подключено: ${appState?.port}`)
-            : 'Плата не подключена'}
-        </span>
-        {connected && snap && (
-          <span>Батарея: <b>{snap.basic.packVoltage.toFixed(2)} В</b></span>
-        )}
-        {connected && lastOkAt > 0 && <span>Обновлено: <b>{fmtClock(lastOkAt)}</b></span>}
-        <span className="sp" />
-        {pollError && <span className="status-alert">{pollError}</span>}
-        {appState?.lastError && !connected && !pollError && (
-          <span className="status-alert">{appState.lastError}</span>
-        )}
-        <span>Версия {health?.app ?? '—'}{health?.commit ? ` · ${health.commit}` : ''}</span>
-      </footer>
-
       {updOpen && (
         <UpdateDialog
-          update={update}
-          onClose={() => setUpdOpen(false)}
-          onCheck={checkUpdate}
-          onRun={runUpdate}
+          update={update} onClose={() => setUpdOpen(false)} onCheck={checkUpdate} onRun={() => { runUpdate(); setUpdOpen(false); }}
         />
       )}
     </div>

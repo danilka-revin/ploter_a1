@@ -49,7 +49,8 @@ export class BmsClient {
   }
 
   #waitFrame(reg, timeoutMs) {
-    return new Promise((resolve, reject) => {
+    let cancel = () => {};
+    const promise = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         if (this.waiter && this.waiter.reg === reg) this.waiter = null;
         reject(new BmsProtocolError('BMS не ответил'));
@@ -58,7 +59,14 @@ export class BmsClient {
         reg,
         resolve: (frame) => { clearTimeout(timer); resolve(frame); },
       };
+      // отменяем ожидание, если запрос не ушёл в порт: иначе таймер позже
+      // породит неиспользованное отклонение (шум в логах и в тестах)
+      cancel = () => {
+        clearTimeout(timer);
+        if (this.waiter && this.waiter.reg === reg) this.waiter = null;
+      };
     });
+    return { promise, cancel };
   }
 
   /** Чтение без очереди — вызывать только изнутри операции из очереди. */
@@ -68,14 +76,20 @@ export class BmsClient {
     for (let attempt = 0; attempt <= this.retries; attempt++) {
       this.rx = Buffer.alloc(0);
       const waiting = this.#waitFrame(reg, this.timeoutMs);
-      await this.transport.write(buildReadFrame(reg, payload));
       try {
-        const frame = await waiting;
+        await this.transport.write(buildReadFrame(reg, payload));
+      } catch (e) {
+        waiting.cancel();
+        throw e;
+      }
+      try {
+        const frame = await waiting.promise;
         if (frame.status !== 0x00) {
           throw new BmsProtocolError(`BMS вернул статус 0x${frame.status.toString(16).padStart(2, '0')} для регистра 0x${reg.toString(16).padStart(2, '0')}`);
         }
         return frame.data;
       } catch (e) {
+        waiting.cancel();
         if (e instanceof BmsProtocolError && e.message === 'BMS не ответил') { lastErr = e; continue; }
         throw e;
       }
@@ -88,8 +102,19 @@ export class BmsClient {
     if (this.closed) throw new BmsProtocolError('соединение закрыто');
     this.rx = Buffer.alloc(0);
     const waiting = this.#waitFrame(reg, this.timeoutMs);
-    await this.transport.write(buildWriteFrame(reg, payload));
-    const frame = await waiting;
+    try {
+      await this.transport.write(buildWriteFrame(reg, payload));
+    } catch (e) {
+      waiting.cancel();
+      throw e;
+    }
+    let frame;
+    try {
+      frame = await waiting.promise;
+    } catch (e) {
+      waiting.cancel();
+      throw e;
+    }
     if (frame.status !== 0x00) throw new BmsProtocolError(`BMS отклонил запись в регистр 0x${reg.toString(16)}`);
     return frame.data;
   }
