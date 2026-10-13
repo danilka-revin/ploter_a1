@@ -51,6 +51,19 @@ test('экраны рендерятся на данных плате и пока
   assert.match(upd, /Сборка программы/);
   assert.match(upd, /Доступна новая версия/);
 
+  const set = m.renderSettingsIdle();
+  assert.match(set, /Прочитать настройки/);
+  assert.match(set, /Записать в плату/);
+  assert.match(m.renderSettingsDisconnected(), /Плата не подключена/);
+  const withData = m.renderSettingsWithData();
+  assert.match(withData, /Перенапряжение ячейки \(OVP\)/);
+  assert.match(withData, /Напряжение ячейки/);
+  assert.match(withData, /3,650 В/);
+  assert.match(withData, /40,0 А/);
+  assert.match(withData, /только чтение/);
+  assert.match(withData, /set-num/);
+  assert.match(withData, /disabled=""[^>]*>Записать в плату/, 'кнопка записи выключена без изменений');
+
   const empty = m.renderOverviewDisconnected();
   assert.match(empty, /Плата не подключена/);
 });

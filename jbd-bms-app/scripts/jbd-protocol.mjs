@@ -267,3 +267,118 @@ export function decodeSetting(def, data) {
   if (def.kind === 'temp') return decodeTemp(raw);
   return raw * (def.scale ?? 1);
 }
+
+// ---------- запись настроек ----------
+//
+// Запись выполняется только в «заводском режиме» (как в bms-tools):
+//   1) регистр 0x06 — пароль (6 байт, по умолчанию нули);
+//   2) регистр 0x00 — вход: 56 78;
+//   3) регистры настроек — 2 байта BE, каждый;
+//   4) регистр 0x01 — выход: 28 28 (сохранить в память платы) или 00 00 (только до выключения).
+// Пределы ниже — в единицах, которые видит пользователь (мВ, мА, мАч, °C).
+
+export const WRITE_REG = { PASSWORD: 0x06, FACTORY: 0x00, EXIT: 0x01 };
+export const FACTORY_ENTER = [0x56, 0x78];
+export const FACTORY_EXIT_SAVE = [0x28, 0x28];
+export const FACTORY_EXIT_DISCARD = [0x00, 0x00];
+
+/** Пределы записываемых настроек. Ключ — key из SETTINGS. cell_cnt намеренно не записывается. */
+export const WRITE_LIMITS = {
+  design_cap: { group: 'Ёмкость', min: 1000, max: 500000, step: 10 },
+  covp: { group: 'Напряжение ячейки', min: 2500, max: 4250, step: 1 },
+  covp_rel: { group: 'Напряжение ячейки', min: 2500, max: 4250, step: 1 },
+  cuvp: { group: 'Напряжение ячейки', min: 1500, max: 3650, step: 1 },
+  cuvp_rel: { group: 'Напряжение ячейки', min: 1500, max: 3800, step: 1 },
+  povp: { group: 'Напряжение батареи', min: 5000, max: 60000, step: 10 },
+  povp_rel: { group: 'Напряжение батареи', min: 5000, max: 60000, step: 10 },
+  puvp: { group: 'Напряжение батареи', min: 5000, max: 60000, step: 10 },
+  puvp_rel: { group: 'Напряжение батареи', min: 5000, max: 60000, step: 10 },
+  chgoc: { group: 'Токи', min: 1000, max: 200000, step: 10 },
+  dsgoc: { group: 'Токи', min: 1000, max: 300000, step: 10 },
+  chgot: { group: 'Температура', min: -20, max: 80, step: 0.1 },
+  chgot_rel: { group: 'Температура', min: -20, max: 80, step: 0.1 },
+  chgut: { group: 'Температура', min: -30, max: 60, step: 0.1 },
+  chgut_rel: { group: 'Температура', min: -30, max: 60, step: 0.1 },
+  dsgot: { group: 'Температура', min: -20, max: 90, step: 0.1 },
+  dsgot_rel: { group: 'Температура', min: -20, max: 90, step: 0.1 },
+  dsgut: { group: 'Температура', min: -30, max: 60, step: 0.1 },
+  dsgut_rel: { group: 'Температура', min: -30, max: 60, step: 0.1 },
+  bal_start: { group: 'Балансировка', min: 1000, max: 4250, step: 1 },
+  bal_window: { group: 'Балансировка', min: 1, max: 500, step: 1 },
+};
+
+/** Пары «срабатывание/возврат» и прочие связи: [ключ_a, оператор, ключ_b, текст]. */
+const CONSISTENCY_RULES = [
+  ['covp', '>', 'covp_rel', 'перенапряжение ячейки должно быть выше возврата'],
+  ['cuvp_rel', '>', 'cuvp', 'возврат после понижения ячейки должен быть выше порога'],
+  ['covp', '>', 'cuvp', 'перенапряжение ячейки должно быть выше понижения'],
+  ['povp', '>', 'povp_rel', 'перенапряжение батареи должно быть выше возврата'],
+  ['puvp_rel', '>', 'puvp', 'возврат после понижения батареи должен быть выше порога'],
+  ['povp', '>', 'puvp', 'перенапряжение батареи должно быть выше понижения'],
+  ['chgot', '>', 'chgot_rel', 'перегрев при заряде должен быть выше возврата'],
+  ['chgut_rel', '>', 'chgut', 'возврат после переохлаждения при заряде должен быть выше порога'],
+  ['dsgot', '>', 'dsgot_rel', 'перегрев при разряде должен быть выше возврата'],
+  ['dsgut_rel', '>', 'dsgut', 'возврат после переохлаждения при разряде должен быть выше порога'],
+  ['chgot', '>', 'chgut', 'перегрев при заряде должен быть выше переохлаждения'],
+  ['dsgot', '>', 'dsgut', 'перегрев при разряде должен быть выше переохлаждения'],
+  ['bal_start', '>', 'bal_window', 'старт балансировки должен быть выше окна'],
+];
+
+const SETTINGS_BY_KEY = Object.fromEntries(SETTINGS.map((d) => [d.key, d]));
+
+/** Описание записываемых настроек для интерфейса. */
+export function writableDefs() {
+  return SETTINGS.filter((d) => WRITE_LIMITS[d.key]).map((d) => ({ ...d, ...WRITE_LIMITS[d.key] }));
+}
+
+/** Проверка одного значения: текст ошибки или null. */
+export function checkSettingValue(key, value) {
+  const def = SETTINGS_BY_KEY[key];
+  const lim = WRITE_LIMITS[key];
+  if (!def || !lim) return `параметр «${key}» нельзя записать`;
+  if (typeof value !== 'number' || !Number.isFinite(value)) return `${def.label}: введите число`;
+  if (value < lim.min || value > lim.max) return `${def.label}: допустимо от ${lim.min} до ${lim.max} ${def.unit}`;
+  try {
+    settingToRaw(def, value);
+  } catch (e) {
+    return e.message;
+  }
+  return null;
+}
+
+/** Значение → сырое 16-битное значение регистра. Ошибка, если значение не кратно разрешению регистра. */
+export function settingToRaw(def, value) {
+  const v = Number(value);
+  if (!Number.isFinite(v)) throw new BmsProtocolError(`${def.label}: значение не число`);
+  let exact;
+  if (def.kind === 'temp') exact = v * 10 + 2731;
+  else if (def.kind === 'count') exact = v;
+  else exact = v / (def.scale ?? 1);
+  const raw = Math.round(exact);
+  if (Math.abs(exact - raw) > 1e-6) {
+    const res = def.kind === 'temp' ? '0,1 °C' : `${def.scale ?? 1} ${def.unit}`;
+    throw new BmsProtocolError(`${def.label}: шаг регистра — ${res}`);
+  }
+  if (raw < 0 || raw > 0xffff) throw new BmsProtocolError(`${def.label}: значение не помещается в регистр`);
+  return raw;
+}
+
+/** Проверка связей между порогами. values — { ключ: значение в единицах интерфейса }; берём только известные. */
+export function checkSettingsConsistency(values) {
+  const errors = [];
+  for (const [a, op, b, text] of CONSISTENCY_RULES) {
+    if (values[a] === undefined || values[b] === undefined) continue;
+    const ok = op === '>' ? values[a] > values[b] : values[a] < values[b];
+    if (!ok) errors.push(`${SETTINGS_BY_KEY[a]?.label ?? a} (${values[a]}) и ${SETTINGS_BY_KEY[b]?.label ?? b} (${values[b]}): ${text}`);
+  }
+  return errors;
+}
+
+/** Пароль платы: пусто (нули) или ровно 6 символов ASCII. */
+export function passwordBytes(password = '') {
+  const out = Buffer.alloc(6);
+  if (!password) return out;
+  if (!/^[\x20-\x7e]{6}$/.test(password)) throw new BmsProtocolError('пароль платы — ровно 6 символов ASCII');
+  Buffer.from(password, 'ascii').copy(out);
+  return out;
+}

@@ -32,7 +32,10 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 
 import { BmsClient } from './bms-client.mjs';
-import { SETTINGS } from './jbd-protocol.mjs';
+import {
+  SETTINGS, WRITE_LIMITS, writableDefs, checkSettingValue, checkSettingsConsistency,
+  settingToRaw, passwordBytes, decodeSetting,
+} from './jbd-protocol.mjs';
 import { listSerialPorts, openSerialTransport } from './serial-transport.mjs';
 import { createFakeTransport } from './fake-bms.mjs';
 import { inspectFirmwareFile, flashFirmware, FirmwareError } from './firmware.mjs';
@@ -88,7 +91,7 @@ async function connect(path) {
   await disconnect();
   let transport;
   if (path === 'demo') {
-    transport = createFakeTransport({ cellCount: 4, name: 'DEMO JBD 4S 12V' });
+    transport = createFakeTransport({ cellCount: 12, name: 'DEMO JBD 12S' });
   } else {
     transport = await openSerialTransport(path);
   }
@@ -158,14 +161,116 @@ async function readSettings() {
   const client = requireClient();
   const items = [];
   for (const def of SETTINGS) {
+    const lim = WRITE_LIMITS[def.key];
+    const base = { key: def.key, label: def.label, unit: def.unit, editable: Boolean(lim) };
+    if (lim) Object.assign(base, { group: lim.group, min: lim.min, max: lim.max, step: lim.step });
     try {
       const value = await client.readSetting(def);
-      items.push({ key: def.key, label: def.label, unit: def.unit, value });
+      items.push({ ...base, value });
     } catch (e) {
-      items.push({ key: def.key, label: def.label, unit: def.unit, value: null, error: e.message });
+      items.push({ ...base, value: null, error: e.message });
     }
   }
   return { at: Date.now(), items };
+}
+
+/**
+ * Запись настроек. Принимает только явное подтверждение (confirm: true), проверяет пределы
+ * и связи порогов с текущими значениями платы, пишет одной операцией и сверяет каждое
+ * значение чтением после записи.
+ */
+async function writeSettingsApi(body) {
+  const client = requireClient();
+  if (body.confirm !== true) throw httpError(400, 'NOT_CONFIRMED', 'Запись не подтверждена.');
+  const changes = body.changes && typeof body.changes === 'object' ? body.changes : null;
+  if (!changes) throw httpError(400, 'BAD_CHANGES', 'Не переданы изменения.');
+  const keys = Object.keys(changes);
+  if (keys.length === 0) throw httpError(400, 'NO_CHANGES', 'Нет изменений для записи.');
+  if (keys.length > 40) throw httpError(400, 'TOO_MANY', 'Слишком много изменений за один раз.');
+
+  const writable = new Set(writableDefs().map((d) => d.key));
+  const errors = [];
+  for (const key of keys) {
+    if (!writable.has(key)) { errors.push(`параметр «${key}» нельзя записать из приложения`); continue; }
+    const value = Number(changes[key]);
+    const err = checkSettingValue(key, value);
+    if (err) errors.push(err);
+  }
+  if (errors.length) throw httpError(400, 'INVALID_VALUES', errors.join('; '));
+
+  let password;
+  try {
+    password = typeof body.password === 'string' ? body.password : '';
+    passwordBytes(password);
+  } catch (e) {
+    throw httpError(400, 'BAD_PASSWORD', e.message);
+  }
+  const save = body.save !== false;
+
+  // текущие значения платы: нужны для сравнения и для проверки связей порогов
+  const current = {};
+  for (const def of SETTINGS) {
+    try { current[def.key] = await client.readSetting(def); } catch { /* значение не прочитано — связь не проверяем */ }
+  }
+  const merged = { ...current };
+  for (const key of keys) merged[key] = Number(changes[key]);
+  const consistency = checkSettingsConsistency(merged);
+  if (consistency.length) throw httpError(400, 'INCONSISTENT', consistency.join('; '));
+
+  const defs = keys.map((key) => SETTINGS.find((d) => d.key === key));
+  const toWrite = defs
+    .filter((d) => current[d.key] === undefined || Number(current[d.key]) !== Number(changes[d.key]))
+    .map((d) => ({ def: d, value: Number(changes[d.key]), raw: settingToRaw(d, Number(changes[d.key])) }));
+  if (toWrite.length === 0) {
+    return { ok: true, saved: false, changed: 0, items: [], message: 'Значения уже совпадают с платой — ничего не записано.' };
+  }
+
+  try {
+    await client.writeSettings(toWrite.map((w) => ({ reg: w.def.reg, raw: w.raw })), { save, password });
+  } catch (e) {
+    throw httpError(502, 'WRITE_FAILED', `Запись не выполнена: ${e.message}. Изменения не сохранены в память платы.`);
+  }
+
+  const items = [];
+  for (const w of toWrite) {
+    let actual = null;
+    let ok = false;
+    try {
+      const raw = await client.readRaw(w.def);
+      actual = decodeRawForDef(w.def, raw);
+      ok = raw === w.raw;
+    } catch (e) {
+      actual = null;
+    }
+    items.push({
+      key: w.def.key, label: w.def.label, unit: w.def.unit,
+      before: current[w.def.key] ?? null, requested: w.value, actual, ok,
+    });
+  }
+  const allOk = items.every((i) => i.ok);
+  return {
+    ok: allOk,
+    saved: save && allOk,
+    changed: toWrite.length,
+    items,
+    message: allOk
+      ? (save
+        ? `Записано ${toWrite.length} ${plural(toWrite.length)} и сохранено в память платы.`
+        : `Записано ${toWrite.length} ${plural(toWrite.length)} (до выключения платы).`)
+      : 'Часть значений не совпала при проверке. Перечитайте настройки и повторите запись.',
+  };
+}
+
+function plural(n) {
+  const m10 = n % 10;
+  const m100 = n % 100;
+  if (m10 === 1 && m100 !== 11) return 'параметр';
+  if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return 'параметра';
+  return 'параметров';
+}
+
+function decodeRawForDef(def, raw) {
+  return decodeSetting(def, Buffer.from([raw >> 8, raw & 0xff]));
 }
 
 // ---------- HTTP ----------
@@ -252,6 +357,9 @@ async function handleApi(req, res, url) {
   }
   if (req.method === 'GET' && pathname === '/api/settings') {
     return send(res, 200, await readSettings());
+  }
+  if (req.method === 'POST' && pathname === '/api/settings/write') {
+    return send(res, 200, await writeSettingsApi(await readJson(req)));
   }
   if (req.method === 'POST' && pathname === '/api/firmware/inspect') {
     const text = (await readBody(req, 1024 * 1024)).toString('utf8');

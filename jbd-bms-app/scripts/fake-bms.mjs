@@ -1,18 +1,37 @@
 // Эмулятор BMS JBD: отвечает на кадры протокола так же, как плата.
 // Нужен для тестов и для демо-режима приложения (без платы). Значения —
-// типичные для LiFePO4-батареи 4S 12 В. Записи принимаются, но состояние
-// эмулятора не меняют.
+// типичные для LiFePO4-батареи 12S (12 последовательных ячеек). Запись настроек
+// принимается только в заводском режиме (как у платы) и сохраняется в EEPROM-модели.
 
-import { buildFrameForResponse, REG, SETTINGS } from './jbd-protocol.mjs';
+import { buildFrameForResponse, REG, SETTINGS, settingToRaw } from './jbd-protocol.mjs';
+
+/** Значения EEPROM по умолчанию, в единицах интерфейса (мВ, мА, мАч, °C). */
+export const DEMO_SETTINGS = {
+  covp: 3650, covp_rel: 3350, cuvp: 2500, cuvp_rel: 2900,
+  povp: 43800, povp_rel: 40200, puvp: 30000, puvp_rel: 33600,
+  chgoc: 40000, dsgoc: 80000,
+  chgot: 45, chgot_rel: 40, chgut: 0, chgut_rel: 5, dsgot: 60, dsgot_rel: 55, dsgut: -20, dsgut_rel: -15,
+  bal_start: 3400, bal_window: 10, design_cap: 100000,
+};
 
 /** Простой «эмулятор» одного устройства: байты запроса → байты ответа. */
 export class FakeBmsDevice {
-  constructor({ cellCount = 4, name = 'DEMO JBD 4S 12V', tick = 0 } = {}) {
+  constructor({ cellCount = 12, name = 'DEMO JBD 12S', tick = 0, password = '' } = {}) {
     this.cellCount = cellCount;
     this.name = name;
     this.tick = tick;
     this.rx = Buffer.alloc(0);
     this.errorCounts = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    // пароль по умолчанию — шесть нулевых байт (как в bms-tools)
+    this.password = password ? Buffer.from(password, 'ascii') : Buffer.alloc(6);
+    this.factory = false;
+    this.writesSaved = 0;
+    // EEPROM-модель: сырые 16-битные значения по регистрам
+    this.eeprom = new Map();
+    for (const def of SETTINGS) {
+      const v = def.key === 'cell_cnt' ? cellCount : DEMO_SETTINGS[def.key];
+      if (v !== undefined) this.eeprom.set(def.reg, settingToRaw(def, v));
+    }
   }
 
   /** Состояние батареи на текущем «кадре симуляции». */
@@ -66,7 +85,7 @@ export class FakeBmsDevice {
   }
 
   #answer(op, reg, data) {
-    if (op === 0x5a) return buildFrameForResponse(reg, 0x00, Buffer.alloc(0)); // запись: принимаем
+    if (op === 0x5a) return this.#write(reg, data);
     if (op !== 0xa5) return Buffer.alloc(0);
     const s = this.state();
     switch (reg) {
@@ -84,10 +103,38 @@ export class FakeBmsDevice {
       }
       default: {
         const def = SETTINGS.find((d) => d.reg === reg);
-        if (def) return buildFrameForResponse(reg, 0x00, this.#settingPayload(def));
+        if (def && this.eeprom.has(reg)) {
+          const b = Buffer.alloc(2);
+          b.writeUInt16BE(this.eeprom.get(reg), 0);
+          return buildFrameForResponse(reg, 0x00, b);
+        }
         return buildFrameForResponse(reg, 0x80, Buffer.alloc(0)); // неизвестный регистр
       }
     }
+  }
+
+  /** Запись: пароль (0x06), вход/выход заводского режима (0x00/0x01), настройки — только в заводском режиме. */
+  #write(reg, data) {
+    if (reg === 0x06) {
+      // данные: длина(1) + пароль(6)
+      const ok = data.length === 7 && data[0] === 6 && data.subarray(1).equals(this.password);
+      return ok ? buildFrameForResponse(reg, 0x00, Buffer.alloc(0)) : buildFrameForResponse(reg, 0x80, Buffer.alloc(0));
+    }
+    if (reg === 0x00) {
+      if (data.length === 2 && data[0] === 0x56 && data[1] === 0x78) this.factory = true;
+      return buildFrameForResponse(reg, 0x00, Buffer.alloc(0));
+    }
+    if (reg === 0x01) {
+      if (this.factory && data.length === 2 && data[0] === 0x28 && data[1] === 0x28) this.writesSaved++;
+      this.factory = false;
+      return buildFrameForResponse(reg, 0x00, Buffer.alloc(0));
+    }
+    const def = SETTINGS.find((d) => d.reg === reg);
+    if (!def || !this.eeprom.has(reg) || !this.factory || data.length !== 2) {
+      return buildFrameForResponse(reg, 0x80, Buffer.alloc(0));
+    }
+    this.eeprom.set(reg, data.readUInt16BE(0));
+    return buildFrameForResponse(reg, 0x00, Buffer.alloc(0));
   }
 
   #basicPayload(s) {
@@ -111,23 +158,6 @@ export class FakeBmsDevice {
     s.temps.forEach((t, i) => b.writeUInt16BE(Math.round(t * 10 + 2731), 23 + i * 2));
     return b.subarray(0, 23 + s.temps.length * 2);
   }
-
-  #settingPayload(def) {
-    // значения, типичные для JBD (сырые величины, как в EEPROM)
-    const defaults = {
-      covp: 3650, covp_rel: 3350, cuvp: 2500, cuvp_rel: 2900,
-      povp: 1460, povp_rel: 1340, puvp: 1000, puvp_rel: 1120,
-      chgoc: 600, dsgoc: 1000,
-      chgot: 45, chgot_rel: 40, chgut: 0, chgut_rel: 5, dsgot: 60, dsgot_rel: 55, dsgut: -20, dsgut_rel: -15,
-      bal_start: 3400, bal_window: 10, design_cap: 10000, cell_cnt: this.cellCount,
-    };
-    const v = defaults[def.key];
-    const b = Buffer.alloc(2);
-    if (def.kind === 'temp') b.writeUInt16BE(Math.round(v * 10 + 2731), 0);
-    else if (def.scale === 10) b.writeUInt16BE(Math.round(v / 10), 0);
-    else b.writeUInt16BE(Math.round(v / (def.scale ?? 1)), 0);
-    return b;
-  }
 }
 
 /** Транспорт в памяти: write() → эмулятор → onData(ответ) асинхронно (как UART). */
@@ -148,4 +178,3 @@ export function createFakeTransport(options = {}) {
     async close() { closed = true; },
   };
 }
-

@@ -4,6 +4,8 @@ import { Overview } from '../src/views/Overview';
 import { Cells } from '../src/views/Cells';
 import { Firmware } from '../src/views/Firmware';
 import { UpdateDialog } from '../src/views/UpdateDialog';
+import { Settings } from '../src/views/Settings';
+import type { SettingsResponse } from '../src/types';
 import type { Snapshot, FirmwareInfo, UpdateSnapshot } from '../src/types';
 
 const snap: Snapshot = {
@@ -87,3 +89,17 @@ export const renderFirmwareWithFile = () => renderToStaticMarkup(
 export const renderUpdate = () => renderToStaticMarkup(
   <UpdateDialog update={upd} onClose={() => {}} onCheck={() => {}} onRun={() => {}} />,
 );
+
+export const renderSettingsIdle = () => renderToStaticMarkup(<Settings connected />);
+export const renderSettingsDisconnected = () => renderToStaticMarkup(<Settings connected={false} />);
+
+const settingsData: SettingsResponse = {
+  at: 0,
+  items: [
+    { key: 'covp', label: 'Перенапряжение ячейки (OVP)', unit: 'мВ', value: 3650, editable: true, group: 'Напряжение ячейки', min: 2500, max: 4250, step: 1 },
+    { key: 'chgoc', label: 'Перегрузка по заряду', unit: 'мА', value: 40000, editable: true, group: 'Токи', min: 1000, max: 200000, step: 10 },
+    { key: 'chgot', label: 'Перегрев при заряде', unit: '°C', value: 45, editable: true, group: 'Температура', min: -20, max: 80, step: 0.1 },
+    { key: 'cell_cnt', label: 'Число ячеек (настройка)', unit: 'шт', value: 12, editable: false },
+  ],
+};
+export const renderSettingsWithData = () => renderToStaticMarkup(<Settings connected initialData={settingsData} />);

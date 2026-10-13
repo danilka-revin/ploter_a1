@@ -65,11 +65,11 @@ test('параллельные запросы выстраиваются в оч
   await client.close();
 });
 
-test('эмулятор принимает запись, но состояние не меняет', () => {
+test('эмулятор отклоняет запись вне заводского режима и на неизвестный регистр', () => {
   const dev = new FakeBmsDevice({ cellCount: 4 });
   const reply = dev.receive(buildWriteFrame(0xe1, [0x00, 0x03]));
   assert.ok(reply.length >= 7);
-  assert.equal(reply[2], 0x00);
+  assert.equal(reply[2], 0x80, 'статус ошибки: регистр неизвестен');
 });
 
 test('после закрытия запросы отклоняются', async () => {

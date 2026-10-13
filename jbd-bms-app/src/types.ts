@@ -51,11 +51,35 @@ export interface SettingItem {
   unit: string;
   value: number | null;
   error?: string;
+  /** можно менять из приложения */
+  editable?: boolean;
+  group?: string;
+  min?: number;
+  max?: number;
+  step?: number;
 }
 
 export interface SettingsResponse {
   at: number;
   items: SettingItem[];
+}
+
+export interface WriteItem {
+  key: string;
+  label: string;
+  unit: string;
+  before: number | null;
+  requested: number;
+  actual: number | null;
+  ok: boolean;
+}
+
+export interface WriteResponse {
+  ok: boolean;
+  saved: boolean;
+  changed: number;
+  items: WriteItem[];
+  message: string;
 }
 
 export interface ConnectResponse {
