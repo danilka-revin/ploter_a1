@@ -11,7 +11,6 @@ export function Overview({ snap, connected, error }: { snap: Snapshot | null; co
   const b = snap.basic;
   const dir = b.packCurrent < -0.05 ? 'разряд' : b.packCurrent > 0.05 ? 'заряд' : 'ток почти нулевой';
   const faultsOk = b.faults.length === 0;
-  const errorsNonZero = snap.errors ? Object.entries(snap.errors).filter(([, v]) => v > 0) : [];
 
   return (
     <div className="grid overview">
@@ -49,17 +48,13 @@ export function Overview({ snap, connected, error }: { snap: Snapshot | null; co
       </section>
 
       <section className="card">
-        <h3>Силовые ключи</h3>
-        <div className="fet-row">
-          <FetBadge label="Заряд" on={b.chargeFetOn} />
-          <FetBadge label="Разряд" on={b.dischargeFetOn} />
-        </div>
-        <h3 className="mt">Балансировка</h3>
+        <h3>Балансировка</h3>
         <p className="muted small">
           {b.balancingCells.length === 0
             ? 'Сейчас не балансируется.'
             : `Балансируются ячейки: ${b.balancingCells.join(', ')}`}
         </p>
+        <p className="muted small mt">Ключи заряда и разряда — на схеме в блоке «Заряд и разряд».</p>
       </section>
 
       <section className="card">
@@ -88,39 +83,14 @@ export function Overview({ snap, connected, error }: { snap: Snapshot | null; co
         ) : (
           <ul className="faults">{b.faults.map((f) => <li key={f.key}>{f.label}</li>)}</ul>
         )}
-        <h3 className="mt">Счётчики срабатываний</h3>
-        {snap.errors === null ? (
-          <p className="muted small">Прошивка не отдаёт счётчики.</p>
-        ) : errorsNonZero.length === 0 ? (
-          <p className="muted small">Срабатываний не было.</p>
-        ) : (
-          <ul className="kv">
-            {errorsNonZero.map(([k, v]) => <li key={k}><span>{ERR_LABEL[k] ?? k}</span><b>{v}</b></li>)}
-          </ul>
-        )}
+        <p className="muted small mt">Счётчики срабатываний и их сброс — в блоке «Управление».</p>
       </section>
     </div>
   );
 }
 
-const ERR_LABEL: Record<string, string> = {
-  sc: 'Короткое замыкание', chgoc: 'Перегрузка заряда', dsgoc: 'Перегрузка разряда',
-  covp: 'Перенапряжение ячейки', cuvp: 'Понижение ячейки', chgot: 'Перегрев заряда',
-  chgut: 'Переохлаждение заряда', dsgot: 'Перегрев разряда', dsgut: 'Переохлаждение разряда',
-  povp: 'Перенапряжение батареи', puvp: 'Понижение батареи',
-};
-
 function Fact({ label, value }: { label: string; value: string }) {
   return <div className="fact"><div className="label">{label}</div><div className="fact-v">{value}</div></div>;
-}
-
-function FetBadge({ label, on }: { label: string; on: boolean }) {
-  return (
-    <div className={`fet ${on ? 'on' : 'off'}`}>
-      <Icon name="bolt" />
-      <div><div className="fet-l">{label}</div><div className="fet-s">{on ? 'включён' : 'выключен'}</div></div>
-    </div>
-  );
 }
 
 export function Empty({ title, children }: { title: string; children?: ReactNode }) {

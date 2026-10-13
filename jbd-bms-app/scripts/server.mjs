@@ -12,6 +12,7 @@
 // API:
 //   GET  /healthz            — жив ли сервер и его версия
 //   GET  /api/ports          — последовательные порты (и пункт «demo» — без платы)
+//   POST /api/scan           — найти батарею: опросить все порты и вернуть, где ответила плата
 //   POST /api/connect        — { path } открыть порт и проверить связь с BMS
 //   POST /api/disconnect     — закрыть порт
 //   GET  /api/snapshot       — состояние батареи, ячейки, счётчики ошибок
@@ -38,6 +39,7 @@ import {
   CTRL_REG, fetRaw, capRemRaw,
 } from './jbd-protocol.mjs';
 import { listSerialPorts, openSerialTransport } from './serial-transport.mjs';
+import { scanBmsPorts } from './port-scan.mjs';
 import { createFakeTransport } from './fake-bms.mjs';
 import { inspectFirmwareFile, flashFirmware, FirmwareError } from './firmware.mjs';
 import { createUpdater, RESTART_EXIT_CODE } from './updater.mjs';
@@ -113,6 +115,14 @@ async function connect(path) {
     await client.close().catch(() => {});
     throw e;
   }
+}
+
+/** Опрос всех портов: где отвечает BMS. Пока плата подключена, порты не трогаем. */
+async function scanApi() {
+  if (session.client) throw httpError(409, 'CONNECTED', 'Плата уже подключена. Сначала нажмите «Отключить», затем ищите батарею.');
+  const ports = await listSerialPorts();
+  const results = await scanBmsPorts(ports);
+  return { at: Date.now(), results, found: results.filter((r) => r.found).map((r) => r.path) };
 }
 
 function requireClient() {
@@ -444,9 +454,16 @@ async function handleApi(req, res, url) {
       const { basic, deviceName } = await connect(path);
       return send(res, 200, { connected: true, port: path, demo: path === 'demo', deviceName, firmwareVersion: basic.firmwareVersion, cellCount: basic.cellCount });
     } catch (e) {
-      session.lastError = e.message;
-      throw httpError(502, 'CONNECT_FAILED', `Плата не отвечает: ${e.message}. Проверьте провода (TX/RX/GND), уровень 3.3 В и права доступа к порту.`);
+      const busy = /^не удалось открыть/.test(e.message);
+      const text = busy
+        ? `Порт ${path} не открылся (${e.message}). Закройте другие программы, которые могут его занимать (например, JBDTools), и проверьте права доступа: в Ubuntu — группа dialout.`
+        : `Плата не отвечает: ${e.message}. Проверьте провода (TX/RX/GND), уровень 3.3 В и выбран ли нужный порт. Если не знаете порт, нажмите «Найти батарею».`;
+      session.lastError = text;
+      throw httpError(502, 'CONNECT_FAILED', text);
     }
+  }
+  if (req.method === 'POST' && pathname === '/api/scan') {
+    return send(res, 200, await scanApi());
   }
   if (req.method === 'POST' && pathname === '/api/disconnect') {
     await disconnect();

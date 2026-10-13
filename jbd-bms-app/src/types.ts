@@ -148,3 +148,21 @@ export interface Health {
   app: string;
   commit: string;
 }
+
+export interface ScanResult {
+  path: string;
+  label: string;
+  found: boolean;
+  /** busy — порт не открылся; silent — порт открылся, плата не ответила */
+  reason: '' | 'busy' | 'silent';
+  deviceName: string;
+  cellCount: number;
+  firmwareVersion: number;
+  detail: string;
+}
+
+export interface ScanResponse {
+  at: number;
+  results: ScanResult[];
+  found: string[];
+}

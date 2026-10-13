@@ -6,7 +6,12 @@ import { Firmware } from '../src/views/Firmware';
 import { UpdateDialog } from '../src/views/UpdateDialog';
 import { Settings } from '../src/views/Settings';
 import { Control } from '../src/views/Control';
-import type { SettingsResponse } from '../src/types';
+import { PowerPanel } from '../src/views/Power';
+import { ConnectionCard } from '../src/views/Connection';
+import { PortHelp } from '../src/views/PortHelp';
+import App from '../src/App';
+import { pickPort } from '../src/ports';
+import type { SettingsResponse, ScanResponse } from '../src/types';
 import type { Snapshot, FirmwareInfo, UpdateSnapshot } from '../src/types';
 
 const snap: Snapshot = {
@@ -106,3 +111,44 @@ const settingsData: SettingsResponse = {
 export const renderSettingsWithData = () => renderToStaticMarkup(<Settings connected initialData={settingsData} />);
 
 export const renderControl = () => renderToStaticMarkup(<Control snap={snap} connected />);
+
+export const renderPower = () => renderToStaticMarkup(<PowerPanel snap={snap} connected port="demo" demo />);
+export const renderPowerDischargeOff = () => renderToStaticMarkup(
+  <PowerPanel snap={{ ...snap, basic: { ...snap.basic, dischargeFetOn: false } }} connected port="/dev/ttyUSB0" demo={false} />,
+);
+export const renderPowerDisconnected = () => renderToStaticMarkup(<PowerPanel snap={null} connected={false} port={null} demo={false} />);
+
+const portList = [
+  { path: '/dev/ttyUSB0', label: '/dev/ttyUSB0 · QinHeng CH340 · 1a86:7523' },
+  { path: '/dev/ttyUSB1', label: '/dev/ttyUSB1 · Silicon Labs CP210x · 10c4:ea60' },
+];
+const scanRes: ScanResponse = {
+  at: 0,
+  found: ['/dev/ttyUSB1'],
+  results: [
+    { path: '/dev/ttyUSB0', label: portList[0].label, found: false, reason: 'busy', deviceName: '', cellCount: 0, firmwareVersion: 0, detail: 'Permission denied' },
+    { path: '/dev/ttyUSB1', label: portList[1].label, found: true, reason: '', deviceName: 'DEMO JBD 12S', cellCount: 12, firmwareVersion: 16, detail: '' },
+  ],
+};
+const demoPort = { path: 'demo', label: 'Демо-режим (без платы)' };
+
+export const renderConnectionScan = () => renderToStaticMarkup(
+  <ConnectionCard
+    ports={portList} demoPort={demoPort} selected="/dev/ttyUSB1" onSelect={() => {}} onRefresh={() => {}}
+    connected={false} busy={false} scanning={false} scan={scanRes} portName={null} demo={false} deviceName=""
+    onConnect={() => {}} onDisconnect={() => {}} onFind={() => {}} onConnectPath={() => {}}
+  />,
+);
+export const renderConnectionEmpty = () => renderToStaticMarkup(
+  <ConnectionCard
+    ports={[]} demoPort={demoPort} selected="demo" onSelect={() => {}} onRefresh={() => {}}
+    connected={false} busy={false} scanning={false} scan={null} portName={null} demo={false} deviceName=""
+    onConnect={() => {}} onDisconnect={() => {}} onFind={() => {}} onConnectPath={() => {}}
+  />,
+);
+export const renderPortHelp = () => renderToStaticMarkup(<PortHelp />);
+export const renderPage = () => renderToStaticMarkup(<App />);
+export const pick = (current: string, ports: string[], userChose: boolean) => pickPort(current, {
+  ports: ports.map((path) => ({ path, label: path })),
+  demo: demoPort,
+}, userChose);

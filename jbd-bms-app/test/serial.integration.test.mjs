@@ -101,3 +101,17 @@ test('порт, которого нет, даёт понятную ошибку'
   await assert.rejects(openSerialTransport('/dev/ttyNOPE-jbd'), /не удалось открыть/);
 });
 
+
+test('поиск батареи находит плату на настоящем порту и не трогает пустой', { skip }, async () => {
+  const { scanBmsPorts } = await import('../scripts/port-scan.mjs');
+  const missing = join(dir, 'nothing-here');
+  const results = await scanBmsPorts([
+    { path: missing, label: 'нет такого порта' },
+    { path: hostEnd, label: 'плата' },
+  ]);
+  assert.equal(results[0].found, false);
+  assert.equal(results[0].reason, 'busy');
+  assert.equal(results[1].found, true, results[1].detail);
+  assert.equal(results[1].cellCount, 4);
+  assert.equal(results[1].deviceName, 'SERIAL DEMO');
+});
