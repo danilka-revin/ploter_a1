@@ -372,7 +372,7 @@ def run(argv: list[str]) -> int:
 
     ap = argparse.ArgumentParser(prog="jbd-bms", description="JBD BMS — чтение и настройка BMS по UART")
     ap.add_argument("--demo", action="store_true", help="сразу открыть демо-режим (без платы)")
-    ap.add_argument("--port", help="порт платы, например /dev/ttyUSB0 — подключиться сразу")
+    ap.add_argument("--port", help="порт платы, например COM3 или /dev/ttyUSB0 — подключиться сразу")
     ap.add_argument("--debug", action="store_true", help="подробный журнал в консоли")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.WARNING)

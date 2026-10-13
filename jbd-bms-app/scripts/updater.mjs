@@ -16,6 +16,7 @@ import { join, relative, sep } from 'node:path';
 
 export const RESTART_EXIT_CODE = 10;
 const CHECK_INTERVAL_MS = 30 * 60_000;
+const NPM_COMMAND = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
 export const UPDATE_STEPS = [
   { id: 'check', title: 'Проверка папки и ветки' },
@@ -134,7 +135,7 @@ export function createUpdater({ appDir, log = () => {} }) {
       await detect();
       if (!gitRoot) {
         setUnsupported('Программа установлена не из git-клона, поэтому автообновление недоступно. '
-          + 'Переустановите её командой: bash install-ubuntu.sh (см. README).');
+          + 'Переустановите её через install-windows.cmd или install-ubuntu.sh (см. README).');
         return snapshot();
       }
       const local = await localCommit();
@@ -234,7 +235,7 @@ export function createUpdater({ appDir, log = () => {} }) {
       const hashFile = join(appDir, 'node_modules', '.lock.sha256');
       const depsOk = existsSync(join(appDir, 'node_modules')) && readText(hashFile) === lockHash;
       if (!depsOk) {
-        const ci = await run('npm', ['ci', '--no-audit', '--no-fund', '--no-update-notifier', '--loglevel=error'],
+        const ci = await run(NPM_COMMAND, ['ci', '--no-audit', '--no-fund', '--no-update-notifier', '--loglevel=error'],
           { cwd: appDir, timeoutMs: 15 * 60_000 });
         if (ci.code !== 0) return void fail('deps', `npm ci: ${ci.out.split('\n').slice(-3).join(' ')}`);
         mkdirSync(join(appDir, 'node_modules'), { recursive: true });
@@ -245,7 +246,7 @@ export function createUpdater({ appDir, log = () => {} }) {
       }
 
       step('build', 'run');
-      const build = await run('npm', ['run', 'build', '--no-update-notifier'], { cwd: appDir, timeoutMs: 10 * 60_000 });
+      const build = await run(NPM_COMMAND, ['run', 'build', '--no-update-notifier'], { cwd: appDir, timeoutMs: 10 * 60_000 });
       if (build.code !== 0) {
         return void fail('build', 'Сборка не прошла — программа продолжит работать на прежней версии. '
           + build.out.split('\n').slice(-3).join(' '));
