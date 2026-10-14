@@ -221,7 +221,7 @@ export function useCockpit() {
   const reconnectBank = useCallback(async (id: string) => {
     setBusy('reconnect');
     try {
-      await api('/api/banks/reconnect', { method: 'POST', body: JSON.stringify({ id }) }, 30_000);
+      await api('/api/banks/reconnect', { method: 'POST', body: JSON.stringify({ id }) }, 600_000);
       note('ok', 'Порт переоткрыт, связь есть.');
       setRegisters(null);
     } catch (e: any) {
@@ -381,8 +381,8 @@ export function useCockpit() {
   const printerTest = useCallback(async () => {
     setBusy('printer-test');
     try {
-      const r = await api<any>('/api/printer/test', { method: 'POST' }, 20_000);
-      note('ok', `Пробный чек напечатан (${r.path} @ ${r.baudRate}).`);
+      const r = await api<any>('/api/printer/test', { method: 'POST' }, 180_000);
+      note('ok', `Пробный чек отправлен на печать (${r.path} @ ${r.baudRate}).`);
     } catch (e: any) { note('err', e.message ?? 'Печать не удалась'); }
     finally { if (alive.current) setBusy(null); }
   }, [note]);
@@ -390,7 +390,7 @@ export function useCockpit() {
   const printSummary = useCallback(async (id: string) => {
     setBusy('printer');
     try {
-      const r = await api<any>('/api/printer/print', { method: 'POST', body: JSON.stringify({ id }) }, 30_000);
+      const r = await api<any>('/api/printer/print', { method: 'POST', body: JSON.stringify({ id }) }, 600_000);
       if (r.banks != null) note('ok', `Сводка по парку (${r.banks} плат) отправлена на печать.`);
       else note('ok', `Сводка по «${r.bank ?? 'аккумулятору'}» отправлена на печать.`);
     } catch (e: any) { note('err', e.message ?? 'Печать сводки не удалась'); }

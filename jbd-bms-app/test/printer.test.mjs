@@ -160,7 +160,7 @@ test('UART-протокол AlexGyver: wake, init, нагрев, таблица,
 
 test('сервис: настройка ширины применяется к уже открытому принтеру, кодировки больше нет', async () => {
   const svc = new PrinterService();
-  const st = svc.configure({ path: '/dev/ttyFAKE', ascii: false, charPage: 17 });
+  const st = svc.configure({ path: '/dev/ttyFAKE', profile: 'alexgyver', lineDelayMs: 0, ascii: false, charPage: 17 });
   assert.equal(st.language, 'en');
   assert.equal('ascii' in st, false);
   assert.equal('charPage' in st, false);
@@ -201,7 +201,7 @@ test('настоящий последовательный порт (socat): пр
     sink.on('data', (chunk) => got.push(chunk));
 
     const svc = new PrinterService();
-    svc.configure({ path: hostEnd, baudRate: 9600, width: 32 });
+    svc.configure({ path: hostEnd, baudRate: 9600, width: 32, profile: 'alexgyver', lineDelayMs: 0 });
     svc._ensure().cmdDelayMs = 2;
     const r = await svc.printFleet([bank, offline], fleet);
     assert.equal(r.ok, true);

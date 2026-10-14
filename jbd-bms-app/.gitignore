@@ -2,3 +2,6 @@ node_modules/
 dist/
 .update-cache/
 *.log
+
+printer.json
+printer.json.tmp

@@ -146,6 +146,7 @@ export interface UpdateStep {
 }
 
 export interface UpdateSnapshot {
+  instanceId?: string;
   phase: UpdatePhase;
   message: string;
   currentSha: string;
@@ -162,6 +163,7 @@ export interface UpdateSnapshot {
 }
 
 export interface Health {
+  instanceId?: string;
   ok: boolean;
   app: string;
   commit: string;
@@ -390,11 +392,14 @@ export interface PortsResponseExtended extends PortsResponse {
 }
 
 export interface PrinterStatus {
+  profile: 'plain' | 'escpos' | 'alexgyver';
+  lineDelayMs: number;
+  printing: boolean;
   configured: boolean;
   path: string;
   baudRate: number;
   width: number;
-  /** язык чека: всегда английский (только ASCII — печатается любым принтером) */
+  /** язык чека: английский, ASCII; требуется совместимый транспорт/протокол */
   language: 'en';
   open: boolean;
   lastError: string;

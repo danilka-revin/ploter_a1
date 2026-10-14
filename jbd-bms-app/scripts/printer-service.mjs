@@ -2,12 +2,13 @@
 // форматирование сводки и печать по протоколу AlexGyver/Printer
 // (TTL UART, 5–9 В, типично 9600/19200 8N1).
 //
-// Чеки печатаются на АНГЛИЙСКОМ и только символами ASCII — так их правильно
-// печатает любой дешёвый термопринтер, без настройки кодовых страниц
-// (см. пояснение в printer.mjs). Подписи банков, имена плат и т. п. из
+// Чеки на английском, данные приводятся к ASCII. Читаемость требует
+// совпадения скорости UART и протокола; ASCII сам по себе это не гарантирует. Подписи банков, имена плат и т. п. из
 // данных приводятся к ASCII транслитом.
 
-import { ReceiptPrinter, PRINTER_BAUDS, renderReceiptText, toPrinterText } from './printer.mjs';
+import { ReceiptPrinter, PRINTER_BAUDS, renderReceiptText, toPrinterText, PRINTER_PROFILES, plainReceipt } from './printer.mjs';
+
+import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 
 /** Допустимая ширина строки чека в символах (58 мм — 32, 80 мм — 48). */
 const WIDTH_MIN = 24;
@@ -16,6 +17,8 @@ const WIDTH_MAX = 48;
 const envBaud = Number(process.env.BMS_PRINTER_BAUD || 9600);
 const envWidth = Number(process.env.BMS_PRINTER_WIDTH || 32);
 const DEFAULTS = {
+  profile: 'plain',
+  lineDelayMs: 800,
   path: process.env.BMS_PRINTER_PORT || '',
   baudRate: PRINTER_BAUDS.includes(envBaud) ? envBaud : 9600,
   width: Number.isInteger(envWidth) && envWidth >= WIDTH_MIN && envWidth <= WIDTH_MAX ? envWidth : 32,
@@ -29,10 +32,17 @@ export class PrinterService {
    *   dd a5 03 00 ff fd 77 — принтер печатает их как иероглифы и «кракозябры»
    *   вместо чека. Печать на такой порт запрещена (см. _ensure).
    */
-  constructor({ log = () => {}, isPortBusy = () => false } = {}) {
+  constructor({ log = () => {}, isPortBusy = () => false, configFile = null } = {}) {
     this.log = log;
     this.isPortBusy = isPortBusy;
     this.config = { ...DEFAULTS };
+    this.configFile = configFile;
+    this.printing = false;
+    this._closing = Promise.resolve();
+    if (configFile && existsSync(configFile)) {
+      try { this.configure(JSON.parse(readFileSync(configFile, 'utf8')), false); }
+      catch (e) { this.log(`Не удалось загрузить настройки принтера: ${e.message}`); }
+    }
     this.printer = null;
     this.lastError = '';
     this.lastPrintAt = 0;
@@ -44,6 +54,9 @@ export class PrinterService {
       path: this.config.path || '',
       baudRate: this.config.baudRate,
       width: this.config.width,
+      profile: this.config.profile,
+      lineDelayMs: this.config.lineDelayMs,
+      printing: this.printing,
       language: 'en',
       // порт отдан принтеру, но на нём висит плата: опрос печатается вместо чека
       busy: this.isPortBusy(this.config.path),
@@ -54,12 +67,22 @@ export class PrinterService {
     };
   }
 
-  configure(patch = {}) {
+  configure(patch = {}, persist = true) {
+    if (this.printing) throw svcError(409, 'PRINTER_BUSY', 'Дождитесь окончания печати перед изменением настроек.');
+    if (patch.profile !== undefined) {
+      if (!PRINTER_PROFILES.includes(patch.profile)) throw svcError(400, 'BAD_PROFILE', 'Неизвестный профиль принтера.');
+    }
+    if (patch.lineDelayMs !== undefined) {
+      const ms = Number(patch.lineDelayMs);
+      if (!Number.isInteger(ms) || ms < 0 || ms > 2000) throw svcError(400, 'BAD_DELAY', 'Пауза должна быть от 0 до 2000 мс.');
+      this.config.lineDelayMs = ms;
+    }
+    if (patch.profile !== undefined) this.config.profile = patch.profile;
     if (typeof patch.path === 'string') {
       const next = String(patch.path || '').trim();
       if (this.printer && (next !== this.config.path || !next)) {
         // порт меняется — закрываем старый
-        this.printer.close().catch(() => {});
+        this._closing = this.printer.close().catch(() => {});
         this.printer = null;
       }
       this.config.path = next;
@@ -68,7 +91,7 @@ export class PrinterService {
       const b = Number(patch.baudRate);
       if (PRINTER_BAUDS.includes(b)) {
         if (b !== this.config.baudRate) {
-          if (this.printer) { this.printer.close().catch(() => {}); this.printer = null; }
+          if (this.printer) { this._closing = this.printer.close().catch(() => {}); this.printer = null; }
           this.config.baudRate = b;
         }
       }
@@ -76,6 +99,10 @@ export class PrinterService {
     if (patch.width !== undefined) {
       const w = Number(patch.width);
       if (Number.isInteger(w) && w >= WIDTH_MIN && w <= WIDTH_MAX) this.config.width = w;
+    }
+    if (persist && this.configFile) {
+      writeFileSync(this.configFile + '.tmp', JSON.stringify(this.config, null, 2) + '\n');
+      renameSync(this.configFile + '.tmp', this.configFile);
     }
     this.log(`конфигурация: ${this.config.path || '(не выбран)'} @ ${this.config.baudRate}, ширина ${this.config.width}, чек на английском (ASCII)`);
     return this.status();
@@ -97,12 +124,37 @@ export class PrinterService {
     }
     // ширина могла поменяться после первой печати — порт ради этого не переоткрываем
     this.printer.width = this.config.width;
+    this.printer.profile = this.config.profile;
+    this.printer.lineDelayMs = this.config.lineDelayMs;
     return this.printer;
   }
 
-  async testPage() {
+  // Короткий тест транспорта: ни ESC, ни нагрев, ни выбор кодовой страницы.
+  async diagnostic() {
+    if (this.printing) throw svcError(409, 'PRINTER_BUSY', 'Принтер уже печатает.');
     const p = this._ensure();
+    this.printing = true;
     try {
+      await this._closing;
+      await p.open();
+      await p.send(Buffer.from(`\r\nUART ${this.config.baudRate} 8N1\r\n`, 'ascii'));
+      await new Promise((resolve) => setTimeout(resolve, this.config.lineDelayMs));
+      await p.send(Buffer.from('Hello 123 ABC abc +-*/\r\n\r\n', 'ascii'));
+      this.lastError = '';
+      this.lastPrintAt = Date.now();
+      return { ok: true, at: this.lastPrintAt, message: 'Байты отправлены. Подтвердите читаемость на бумаге.' };
+    } catch (e) {
+      this.lastError = e.message;
+      throw svcError(502, 'PRINT_FAILED', `Тест UART: ${e.message}`);
+    } finally { this.printing = false; }
+  }
+
+  async testPage() {
+    if (this.printing) throw svcError(409, 'PRINTER_BUSY', 'Принтер уже печатает.');
+    const p = this._ensure();
+    this.printing = true;
+    try {
+      await this._closing;
       await p.open();
       await p.printLines(buildTestPage({ path: p.path, baudRate: p.baudRate, width: p.width }));
       this.lastError = '';
@@ -110,8 +162,8 @@ export class PrinterService {
       return { ok: true, at: this.lastPrintAt, path: p.path, baudRate: p.baudRate };
     } catch (e) {
       this.lastError = e.message;
-      throw svcError(502, 'PRINT_FAILED', `Принтер не напечатал: ${e.message}`);
-    }
+      throw svcError(502, 'PRINT_FAILED', `Не удалось отправить текст: ${e.message}`);
+    } finally { this.printing = false; }
   }
 
   /**
@@ -120,8 +172,11 @@ export class PrinterService {
    * @param {object} fleet        — итоги парка (для сводки "всего в парке")
    */
   async printBank(bankRow, fleet = null) {
+    if (this.printing) throw svcError(409, 'PRINTER_BUSY', 'Принтер уже печатает.');
     const p = this._ensure();
+    this.printing = true;
     try {
+      await this._closing;
       await p.open();
       await p.printLines(buildBankReceipt(bankRow, fleet, p.width));
       this.lastError = '';
@@ -130,13 +185,16 @@ export class PrinterService {
     } catch (e) {
       this.lastError = e.message;
       throw svcError(502, 'PRINT_FAILED', `Печать сводки не удалась: ${e.message}`);
-    }
+    } finally { this.printing = false; }
   }
 
   /** Напечатать сводку по всем банкам (парку) с компактной таблицей. */
   async printFleet(rows, fleet) {
+    if (this.printing) throw svcError(409, 'PRINTER_BUSY', 'Принтер уже печатает.');
     const p = this._ensure();
+    this.printing = true;
     try {
+      await this._closing;
       await p.open();
       await p.printLines(buildFleetReceipt(rows, fleet, p.width));
       this.lastError = '';
@@ -145,28 +203,33 @@ export class PrinterService {
     } catch (e) {
       this.lastError = e.message;
       throw svcError(502, 'PRINT_FAILED', `Печать сводки по парку не удалась: ${e.message}`);
-    }
+    } finally { this.printing = false; }
   }
 
   // ---------- предпросмотр: тот же чек обычным текстом, без принтера ----------
 
+  _render(lines, width) {
+    return renderReceiptText(this.config.profile === 'plain' ? plainReceipt(lines) : lines, width);
+  }
+
   previewTest() {
     const width = this.config.width;
     const lines = buildTestPage({ path: this.config.path || '(not selected)', baudRate: this.config.baudRate, width });
-    return { kind: 'test', width, lines: renderReceiptText(lines, width) };
+    return { kind: 'test', width, lines: this._render(lines, width) };
   }
 
   previewBank(bankRow, fleet = null) {
     const width = this.config.width;
-    return { kind: 'bank', width, lines: renderReceiptText(buildBankReceipt(bankRow, fleet, width), width) };
+    return { kind: 'bank', width, lines: this._render(buildBankReceipt(bankRow, fleet, width), width) };
   }
 
   previewFleet(rows, fleet) {
     const width = this.config.width;
-    return { kind: 'fleet', width, lines: renderReceiptText(buildFleetReceipt(rows, fleet, width), width) };
+    return { kind: 'fleet', width, lines: this._render(buildFleetReceipt(rows, fleet, width), width) };
   }
 
   async close() {
+    await this._closing;
     if (this.printer) await this.printer.close().catch(() => {});
     this.printer = null;
   }
