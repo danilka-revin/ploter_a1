@@ -88,7 +88,12 @@ export const banks = new BankManager({
 });
 banks.start();
 
-export const printer = new PrinterService({ log: (m) => console.log('принтер: ' + m) });
+// Порт принтера не должен опрашиваться как BMS: кадр опроса (dd a5 03 00 ff fd 77)
+// принтер напечатает иероглифами. isPortBusy не даёт печатать в порт, занятый платой.
+export const printer = new PrinterService({
+  log: (m) => console.log('принтер: ' + m),
+  isPortBusy: (path) => Boolean(path) && banks.list().some((b) => b.path === path),
+});
 
 const firmware = { text: null, name: '' };
 
@@ -120,12 +125,18 @@ function legacySnapshot(bank) {
   };
 }
 
-/** Опрос всех портов, кроме занятых подключёнными банками. */
+/**
+ * Опрос портов: все, кроме занятых подключёнными банками и кроме порта принтера.
+ * Порт принтера исключён всегда (даже с force): поиск плат шлёт в него кадры
+ * dd a5 03 00 ff fd 77, и принтер печатает их непонятными символами.
+ */
 async function scanApi({ includeConnected = false } = {}) {
   const used = new Set(banks.list().map((b) => b.path));
-  const ports = (await listSerialPorts()).filter((p) => includeConnected || !used.has(p.path));
+  const skip = new Set([printer.config.path].filter(Boolean));
+  const ports = (await listSerialPorts())
+    .filter((p) => !skip.has(p.path) && (includeConnected || !used.has(p.path)));
   const results = await scanBmsPorts(ports);
-  return { at: Date.now(), results, found: results.filter((r) => r.found).map((r) => r.path), busy: [...used] };
+  return { at: Date.now(), results, found: results.filter((r) => r.found).map((r) => r.path), busy: [...used], skipped: [...skip] };
 }
 
 // ---------- HTTP ----------
@@ -170,6 +181,20 @@ function checkPath(path) {
   return path;
 }
 
+/**
+ * Порт, отданный принтеру, нельзя занимать под плату: опрос BMS шлёт в него
+ * кадры dd a5 03 00 ff fd 77, и принтер печатает их непонятными символами
+ * вместо чека (плюс порт остаётся заблокированным для печати).
+ */
+function checkNotPrinterPort(path) {
+  if (path === printer.config.path) {
+    throw httpError(409, 'PORT_IS_PRINTER',
+      `Порт ${path} — чековый принтер. Опрос BMS на нём печатает непонятные символы вместо чека, `
+      + 'поэтому плату на него не подключаем. Выберите порт платы.');
+  }
+  return path;
+}
+
 function secondsOf(url) {
   const raw = Number(url.searchParams.get('seconds') || url.searchParams.get('window') || 600);
   return Math.max(15, Math.min(7200, Number.isFinite(raw) && raw > 0 ? raw : 600));
@@ -204,8 +229,14 @@ async function handleApi(req, res, url) {
   }
   if (method === 'GET' && pathname === '/api/ports') {
     const used = new Set(banks.list().map((b) => b.path));
+    const printerPath = printer.config.path;
     return send(res, 200, {
-      ports: (await listSerialPorts()).map((p) => ({ ...p, used: used.has(p.path) })),
+      printerPath,
+      ports: (await listSerialPorts()).map((p) => ({
+        ...p,
+        used: used.has(p.path),
+        printer: Boolean(printerPath) && p.path === printerPath,
+      })),
       demo: { path: 'demo', label: 'Демо-режим (без платы)' },
     });
   }
@@ -217,7 +248,7 @@ async function handleApi(req, res, url) {
   if (method === 'GET' && pathname === '/api/banks') return send(res, 200, { at: Date.now(), pollMs: banks.pollMs, banks: banks.list().map((b) => banks.row(b)) });
   if (method === 'POST' && pathname === '/api/banks/add') {
     const body = await readJson(req);
-    const path = checkPath(String(body.path || ''));
+    const path = checkNotPrinterPort(checkPath(String(body.path || '')));
     try {
       const bank = await banks.add({ path, label: String(body.label || '') });
       return send(res, 200, { id: bank.id, path: bank.path, label: bank.label, deviceName: bank.deviceName, cellCount: bank.basic?.cellCount ?? 0 });
@@ -332,7 +363,7 @@ async function handleApi(req, res, url) {
   // ----- старые одиночные адреса -----
   if (method === 'POST' && pathname === '/api/connect') {
     const body = await readJson(req);
-    const path = checkPath(String(body.path || ''));
+    const path = checkNotPrinterPort(checkPath(String(body.path || '')));
     await banks.removeAll();
     try {
       const bank = await banks.add({ path });
@@ -392,7 +423,20 @@ async function handleApi(req, res, url) {
   }
   if (method === 'POST' && pathname === '/api/printer/config') {
     const body = await readJson(req);
-    return send(res, 200, printer.configure(body));
+    // Порт отдали принтеру — если на нём висел банк, отключаем его: иначе опрос
+    // платы (dd a5 03 …) продолжит печататься на принтере поверх чека.
+    let freedPort = '';
+    const next = typeof body.path === 'string' ? body.path.trim() : '';
+    // порт освобождаем и при смене порта, и при повторном выборе того же (кнопка «освободить порт»)
+    if (next && (next !== printer.config.path || printer.isPortBusy(next))) {
+      const clash = banks.list().find((b) => b.path === next);
+      if (clash) {
+        await banks.remove(clash.id).catch(() => {});
+        freedPort = next;
+        console.log(`принтер: порт ${next} освобождён от банка «${clash.label}» — теперь это порт принтера`);
+      }
+    }
+    return send(res, 200, { ...printer.configure(body), freedPort });
   }
   if (method === 'POST' && pathname === '/api/printer/test') {
     return send(res, 200, await printer.testPage());

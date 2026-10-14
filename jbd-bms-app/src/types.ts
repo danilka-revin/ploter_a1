@@ -1,10 +1,19 @@
 // Типы ответов API (scripts/server.mjs). Держать в соответствии с сервером.
 
-export interface PortItem { path: string; label: string }
+export interface PortItem {
+  path: string;
+  label: string;
+  /** порт занят подключённой платой (банком) */
+  used?: boolean;
+  /** порт отдан чековому принтеру — плату на него подключать нельзя */
+  printer?: boolean;
+}
 
 export interface PortsResponse {
   ports: PortItem[];
   demo: PortItem;
+  /** порт, выбранный для чекового принтера (не опрашивается как BMS) */
+  printerPath?: string;
 }
 
 export interface Basic {
@@ -391,6 +400,10 @@ export interface PrinterStatus {
   lastError: string;
   lastPrintAt: number;
   bauds: number[];
+  /** порт отдан принтеру, но на нём висит плата (опрос печатается вместо чека) */
+  busy: boolean;
+  /** порт, который пришлось освободить от банка, когда его отдали принтеру */
+  freedPort?: string;
 }
 
 /** Чек обычным текстом, как он ляжет на бумагу (GET /api/printer/preview). */
