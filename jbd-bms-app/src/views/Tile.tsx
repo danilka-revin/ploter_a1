@@ -70,9 +70,13 @@ export function NumField({
   );
 }
 
-export function Chip({ on, onClick, children, title }: { on?: boolean; onClick?: () => void; children: ReactNode; title?: string }) {
+export function Chip({
+  on, onClick, children, title, disabled,
+}: {
+  on?: boolean; onClick?: () => void; children: ReactNode; title?: string; disabled?: boolean;
+}) {
   return (
-    <button type="button" className={`chip${on ? ' on' : ''}`} onClick={onClick} title={title} aria-pressed={Boolean(on)}>
+    <button type="button" className={`chip${on ? ' on' : ''}`} onClick={onClick} disabled={disabled} title={title} aria-pressed={Boolean(on)}>
       {children}
     </button>
   );

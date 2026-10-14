@@ -7,8 +7,10 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from './api';
+import { reportLevelLabel } from './printer-levels';
 import type {
-  BankRegisters, BankRow, Catalog, ControlResponse, Panel, PortItem, PrinterStatus, RawReadResponse, RawWriteResponse, Series,
+  BankRegisters, BankRow, Catalog, ControlResponse, Panel, PortItem, PrintResult, PrinterStatus, RawReadResponse,
+  RawWriteResponse, ReportLevel, Series,
 } from './types';
 
 const WINDOW_KEY = 'jbd.window';
@@ -387,12 +389,14 @@ export function useCockpit() {
     finally { if (alive.current) setBusy(null); }
   }, [note]);
 
-  const printSummary = useCallback(async (id: string) => {
+  const printSummary = useCallback(async (id: string, level?: ReportLevel) => {
     setBusy('printer');
     try {
-      const r = await api<any>('/api/printer/print', { method: 'POST', body: JSON.stringify({ id }) }, 600_000);
-      if (r.banks != null) note('ok', `Сводка по парку (${r.banks} плат) отправлена на печать.`);
-      else note('ok', `Сводка по «${r.bank ?? 'аккумулятору'}» отправлена на печать.`);
+      const body = level ? { id, level } : { id };
+      const r = await api<PrintResult>('/api/printer/print', { method: 'POST', body: JSON.stringify(body) }, 600_000);
+      const kind = `чек ${reportLevelLabel(r.level ?? level)}`;
+      if (r.banks != null) note('ok', `Сводка по парку (${r.banks} плат) отправлена на печать · ${kind}.`);
+      else note('ok', `Сводка по «${r.bank ?? 'аккумулятору'}» отправлена на печать · ${kind}.`);
     } catch (e: any) { note('err', e.message ?? 'Печать сводки не удалась'); }
     finally { if (alive.current) setBusy(null); }
   }, [note]);

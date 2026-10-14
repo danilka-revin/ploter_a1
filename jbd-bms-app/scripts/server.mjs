@@ -32,13 +32,15 @@
 //   GET  /api/catalog                     — описания регистров, настроек и команд
 //   POST /api/poll {ms}                    — задать период опроса
 //   GET  /api/printer                     — статус TTL-чекового принтера
-//   POST /api/printer/config              — настройки принтера (порт, скорость, ширина строки)
+//   POST /api/printer/config              — настройки принтера (порт, скорость, ширина строки, вид чека)
 //   POST /api/printer/query               — спросить у принтера состояние (нет бумаги, ошибка)
 //   POST /api/printer/detect              — автопоиск скорости UART по ответу принтера
 //   POST /api/printer/sweep               — печать блоков на всех скоростях (ищем читаемый)
 //   POST /api/printer/test                — пробная страница
-//   POST /api/printer/print {id}          — печать сводки по банку (id=all — по парку)
-//   GET  /api/printer/preview?id=         — тот же чек текстом, без печати (id=all — парк, id=test — пробная)
+//   POST /api/printer/print {id, level}   — печать сводки по банку (id=all — по парку)
+//                                           level: short (короткая) | medium (средняя) | full (полная);
+//                                           без level печатается вид из настроек принтера
+//   GET  /api/printer/preview?id=&level=  — тот же чек текстом, без печати (id=all — парк, id=test — пробная)
 //   Чеки на английском, ASCII; скорость и профиль должны соответствовать модели.
 //
 // Старые одиночные адреса сохранены: /api/connect, /api/disconnect, /api/state,
@@ -66,7 +68,7 @@ import { scanBmsPorts } from './port-scan.mjs';
 import { inspectFirmwareFile, flashFirmware, FirmwareError } from './firmware.mjs';
 import { createUpdater, RESTART_EXIT_CODE } from './updater.mjs';
 import { parseIntelHex } from './intel-hex.mjs';
-import { PrinterService } from './printer-service.mjs';
+import { PrinterService, REPORT_LEVELS } from './printer-service.mjs';
 
 const APP_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const DIST = join(APP_DIR, 'dist');
@@ -206,6 +208,20 @@ function checkNotPrinterPort(path) {
 function secondsOf(url) {
   const raw = Number(url.searchParams.get('seconds') || url.searchParams.get('window') || 600);
   return Math.max(15, Math.min(7200, Number.isFinite(raw) && raw > 0 ? raw : 600));
+}
+
+/**
+ * Вид чека из запроса: короткий (short), средний (medium) или полный (full).
+ * Без параметра возвращает null — тогда печатается вид из настроек принтера.
+ */
+function printerLevel(raw) {
+  const level = String(raw ?? '').trim().toLowerCase();
+  if (!level) return null;
+  if (!REPORT_LEVELS.includes(level)) {
+    throw httpError(400, 'BAD_LEVEL',
+      `Неизвестный вид чека «${raw}»: короткий (short), средний (medium) или полный (full).`);
+  }
+  return level;
 }
 
 async function handleApi(req, res, url) {
@@ -465,25 +481,28 @@ async function handleApi(req, res, url) {
   if (method === 'POST' && pathname === '/api/printer/print') {
     const body = await readJson(req);
     const target = body.id === 'all' || body.all ? null : (body.id || null);
+    // вид чека: короткий, средний или полный; без него — вид из настроек принтера
+    const level = printerLevel(body.level ?? body.reportLevel);
     if (target === null) {
       const rows = banks.list().map((b) => banks.row(b));
       if (!rows.length) throw httpError(409, 'NO_BANK', 'Нет подключённых аккумуляторов.');
-      return send(res, 200, await printer.printFleet(rows, banks.fleet()));
+      return send(res, 200, await printer.printFleet(rows, banks.fleet(), level));
     }
     const bank = banks.get(target);
     // обновляем данные, если банк на связи; не падаем, если опрос не удался — печатаем то, что есть
     if (bank.connected) await banks.pollOne(bank).catch(() => {});
-    return send(res, 200, await printer.printBank(banks.row(bank), banks.fleet()));
+    return send(res, 200, await printer.printBank(banks.row(bank), banks.fleet(), level));
   }
   if (method === 'GET' && pathname === '/api/printer/preview') {
     const id = q.get('id') || 'all';
     if (id === 'test') return send(res, 200, printer.previewTest());
+    const level = printerLevel(q.get('level') ?? q.get('reportLevel'));
     if (id === 'all') {
       const rows = banks.list().map((b) => banks.row(b));
       if (!rows.length) throw httpError(409, 'NO_BANK', 'Нет подключённых аккумуляторов.');
-      return send(res, 200, printer.previewFleet(rows, banks.fleet()));
+      return send(res, 200, printer.previewFleet(rows, banks.fleet(), level));
     }
-    return send(res, 200, printer.previewBank(banks.row(banks.get(id)), banks.fleet()));
+    return send(res, 200, printer.previewBank(banks.row(banks.get(id)), banks.fleet(), level));
   }
 
   // ----- прошивка -----

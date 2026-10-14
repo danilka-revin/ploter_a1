@@ -14,6 +14,21 @@ import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 const WIDTH_MIN = 24;
 const WIDTH_MAX = 48;
 
+/**
+ * Три вида чека — одна и та же сводка разной глубины:
+ *   short  — только главное: статус, В/А/Вт, заряд, остаток, разброс и крайние банки,
+ *            максимальная температура и активные защиты (короткий чек ~20 строк);
+ *   medium — main + число циклов, сетка всех банок с метками, температуры по датчикам,
+ *            ключи заряда/разряда, балансировка и активные защиты (обычный чек, ~45 строк);
+ *   full   — medium + каждая банка отдельной строкой с отклонением от среднего, счётчики
+ *            срабатываний защит, паспорт платы и итоги парка (полный чек, ~75 строк).
+ */
+export const REPORT_LEVELS = ['short', 'medium', 'full'];
+/** Вид чека по умолчанию: средний (можно задать BMS_PRINTER_REPORT). */
+export const DEFAULT_REPORT_LEVEL = REPORT_LEVELS.includes(process.env.BMS_PRINTER_REPORT || '')
+  ? process.env.BMS_PRINTER_REPORT
+  : 'medium';
+
 const envBaud = Number(process.env.BMS_PRINTER_BAUD || 9600);
 const envWidth = Number(process.env.BMS_PRINTER_WIDTH || 32);
 const DEFAULTS = {
@@ -23,7 +38,17 @@ const DEFAULTS = {
   baudRate: PRINTER_BAUDS.includes(envBaud) ? envBaud : 9600,
   width: Number.isInteger(envWidth) && envWidth >= WIDTH_MIN && envWidth <= WIDTH_MAX ? envWidth : 32,
   framing: PRINTER_FRAMINGS.includes(process.env.BMS_PRINTER_FRAMING || '') ? process.env.BMS_PRINTER_FRAMING : '8N1',
+  reportLevel: DEFAULT_REPORT_LEVEL,
 };
+
+/**
+ * Вид чека без учёта регистра: 'SHORT' → 'short'. Незнакомое значение
+ * (старый printer.json, чужой вызов buildBankReceipt) приводится к среднему.
+ */
+function levelOf(v, fallback = DEFAULT_REPORT_LEVEL) {
+  const key = String(v ?? '').trim().toLowerCase();
+  return REPORT_LEVELS.includes(key) ? key : fallback;
+}
 
 export class PrinterService {
   /**
@@ -41,8 +66,12 @@ export class PrinterService {
     this.printing = false;
     this._closing = Promise.resolve();
     if (configFile && existsSync(configFile)) {
-      try { this.configure(JSON.parse(readFileSync(configFile, 'utf8')), false); }
-      catch (e) { this.log(`Не удалось загрузить настройки принтера: ${e.message}`); }
+      try {
+        const saved = JSON.parse(readFileSync(configFile, 'utf8'));
+        // старый printer.json без вида чека (или с опечаткой) не должен терять весь файл
+        if (saved && !REPORT_LEVELS.includes(saved.reportLevel)) delete saved.reportLevel;
+        this.configure(saved, false);
+      } catch (e) { this.log(`Не удалось загрузить настройки принтера: ${e.message}`); }
     }
     this.printer = null;
     this.lastError = '';
@@ -58,6 +87,9 @@ export class PrinterService {
       width: this.config.width,
       profile: this.config.profile,
       lineDelayMs: this.config.lineDelayMs,
+      /** вид чека: short (короткий), medium (средний), full (полный) */
+      reportLevel: this.config.reportLevel,
+      reportLevels: REPORT_LEVELS,
       printing: this.printing,
       language: 'en',
       // порт отдан принтеру, но на нём висит плата: опрос печатается вместо чека
@@ -82,6 +114,14 @@ export class PrinterService {
       const ms = Number(patch.lineDelayMs);
       if (!Number.isInteger(ms) || ms < 0 || ms > 2000) throw svcError(400, 'BAD_DELAY', 'Пауза должна быть от 0 до 2000 мс.');
       this.config.lineDelayMs = ms;
+    }
+    if (patch.reportLevel !== undefined) {
+      const level = String(patch.reportLevel ?? '').trim().toLowerCase();
+      if (!REPORT_LEVELS.includes(level)) {
+        throw svcError(400, 'BAD_LEVEL',
+          `Неизвестный вид чека «${patch.reportLevel}»: короткий (short), средний (medium) или полный (full).`);
+      }
+      this.config.reportLevel = level;
     }
     if (patch.profile !== undefined) this.config.profile = patch.profile;
     if (patch.framing !== undefined && patch.framing !== this.config.framing) {
@@ -112,8 +152,23 @@ export class PrinterService {
       if (Number.isInteger(w) && w >= WIDTH_MIN && w <= WIDTH_MAX) this.config.width = w;
     }
     if (persist) this._persist();
-    this.log(`конфигурация: ${this.config.path || '(не выбран)'} @ ${this.config.baudRate} ${this.config.framing}, ширина ${this.config.width}, чек на английском (ASCII)`);
+    this.log(`конфигурация: ${this.config.path || '(не выбран)'} @ ${this.config.baudRate} ${this.config.framing}, ширина ${this.config.width}, чек ${this.config.reportLevel} на английском (ASCII)`);
     return this.status();
+  }
+
+  /**
+   * Вид чека для очередной печати: параметр запроса важнее настройки принтера.
+   * @param {string|null|undefined} requested 'short' | 'medium' | 'full'
+   * @returns {'short'|'medium'|'full'}
+   */
+  _level(requested) {
+    const asked = String(requested ?? '').trim().toLowerCase();
+    if (!asked) return this.config.reportLevel;
+    if (!REPORT_LEVELS.includes(asked)) {
+      throw svcError(400, 'BAD_LEVEL',
+        `Неизвестный вид чека «${requested}»: выберите короткий (short), средний (medium) или полный (full).`);
+    }
+    return asked;
   }
 
   /** Сохранить настройки на диск (рядом с package.json, файл игнорируется Git). */
@@ -339,36 +394,44 @@ export class PrinterService {
    * Напечатать сводку по одному банку (BMS).
    * @param {object} bankRow      — строка банка из banks.row()
    * @param {object} fleet        — итоги парка (для сводки "всего в парке")
+   * @param {'short'|'medium'|'full'} [level] — вид чека; без него берётся настройка принтера
    */
-  async printBank(bankRow, fleet = null) {
+  async printBank(bankRow, fleet = null, level = null) {
     if (this.printing) throw svcError(409, 'PRINTER_BUSY', 'Принтер уже печатает.');
+    const lvl = this._level(level);
     const p = this._ensure();
     this.printing = true;
     try {
       await this._closing;
       await p.open();
-      await p.printLines(buildBankReceipt(bankRow, fleet, p.width));
+      await p.printLines(buildBankReceipt(bankRow, fleet, p.width, lvl));
       this.lastError = '';
       this.lastPrintAt = Date.now();
-      return { ok: true, at: this.lastPrintAt, bank: bankRow.label, path: p.path };
+      return { ok: true, at: this.lastPrintAt, bank: bankRow.label, path: p.path, level: lvl };
     } catch (e) {
       this.lastError = e.message;
       throw svcError(502, 'PRINT_FAILED', `Печать сводки не удалась: ${e.message}`);
     } finally { this.printing = false; }
   }
 
-  /** Напечатать сводку по всем банкам (парку) с компактной таблицей. */
-  async printFleet(rows, fleet) {
+  /**
+   * Напечатать сводку по всем банкам (парку).
+   * @param {object[]} rows — строки банков из banks.row()
+   * @param {object} fleet  — итоги парка
+   * @param {'short'|'medium'|'full'} [level] — вид чека; без него берётся настройка принтера
+   */
+  async printFleet(rows, fleet, level = null) {
     if (this.printing) throw svcError(409, 'PRINTER_BUSY', 'Принтер уже печатает.');
+    const lvl = this._level(level);
     const p = this._ensure();
     this.printing = true;
     try {
       await this._closing;
       await p.open();
-      await p.printLines(buildFleetReceipt(rows, fleet, p.width));
+      await p.printLines(buildFleetReceipt(rows, fleet, p.width, lvl));
       this.lastError = '';
       this.lastPrintAt = Date.now();
-      return { ok: true, at: this.lastPrintAt, banks: rows.length, path: p.path };
+      return { ok: true, at: this.lastPrintAt, banks: rows.length, path: p.path, level: lvl };
     } catch (e) {
       this.lastError = e.message;
       throw svcError(502, 'PRINT_FAILED', `Печать сводки по парку не удалась: ${e.message}`);
@@ -384,17 +447,19 @@ export class PrinterService {
   previewTest() {
     const width = this.config.width;
     const lines = buildTestPage({ path: this.config.path || '(not selected)', baudRate: this.config.baudRate, width });
-    return { kind: 'test', width, lines: this._render(lines, width) };
+    return { kind: 'test', level: null, width, lines: this._render(lines, width) };
   }
 
-  previewBank(bankRow, fleet = null) {
+  previewBank(bankRow, fleet = null, level = null) {
     const width = this.config.width;
-    return { kind: 'bank', width, lines: this._render(buildBankReceipt(bankRow, fleet, width), width) };
+    const lvl = this._level(level);
+    return { kind: 'bank', level: lvl, width, lines: this._render(buildBankReceipt(bankRow, fleet, width, lvl), width) };
   }
 
-  previewFleet(rows, fleet) {
+  previewFleet(rows, fleet, level = null) {
     const width = this.config.width;
-    return { kind: 'fleet', width, lines: this._render(buildFleetReceipt(rows, fleet, width), width) };
+    const lvl = this._level(level);
+    return { kind: 'fleet', level: lvl, width, lines: this._render(buildFleetReceipt(rows, fleet, width, lvl), width) };
   }
 
   async close() {
@@ -531,7 +596,15 @@ function baudSweepLines(baudRate, framing) {
   ];
 }
 
-function buildBankReceipt(b, fleet, width = 32) {
+/**
+ * Чек по одному аккумулятору. Вид чека (level) решает, сколько блоков попадёт
+ * на бумагу: короткий — только главное, средний — ещё сетка банок и температуры,
+ * полный — плюс каждая банка строкой, счётчики защит, паспорт платы и итоги парка.
+ */
+function buildBankReceipt(b, fleet, width = 32, level = DEFAULT_REPORT_LEVEL) {
+  const lvl = levelOf(level);
+  const brief = lvl === 'short';
+  const full = lvl === 'full';
   const st = b.stats;
   const T = b.temperatures || [];
   const cells = b.cells || [];
@@ -542,59 +615,100 @@ function buildBankReceipt(b, fleet, width = 32) {
   if (b.model) lines.push({ t: 'text', text: `Model: ${b.model}`, align: 1 });
   lines.push({ t: 'divider' });
 
+  lines.push({ t: 'row', left: 'Report', right: lvl });
   lines.push({ t: 'row', left: 'Status', right: b.connected ? 'online' : 'OFFLINE' });
   lines.push({ t: 'row', left: 'Updated', right: fmtTime(b.at) });
-  lines.push({ t: 'row', left: 'Port', right: b.demo ? 'demo' : b.path });
+  if (!brief) lines.push({ t: 'row', left: 'Port', right: b.demo ? 'demo' : b.path });
   lines.push({ t: 'divider' });
 
-  lines.push({ t: 'text', text: 'MAIN READINGS', bold: true });
+  // В коротком чеке заголовки блоков не печатаются: экономим строки бумаги.
+  if (!brief) lines.push({ t: 'text', text: 'MAIN READINGS', bold: true });
   lines.push({ t: 'row', left: 'Voltage', right: num(b.voltage, 2, 'V') });
   lines.push({ t: 'row', left: 'Current', right: num(b.current, 2, 'A') });
   lines.push({ t: 'row', left: 'Power', right: num(b.power, 1, 'W') });
   lines.push({ t: 'row', left: 'State of charge', right: num(b.soc, 0, '%') });
   lines.push({ t: 'row', left: 'Remaining', right: ah(b.remainingAh, b.fullAh) });
-  lines.push({ t: 'row', left: 'Cycles', right: isNum(b.cycles) ? String(b.cycles) : 'n/a' });
-  lines.push({ t: 'row', left: 'Cells in series', right: `${b.cellCount || cells.length}S` });
+  if (!brief) lines.push({ t: 'row', left: 'Cycles', right: isNum(b.cycles) ? String(b.cycles) : 'n/a' });
+  lines.push({ t: 'row', left: brief ? 'Cells' : 'Cells in series', right: `${b.cellCount || cells.length}S` });
   lines.push({ t: 'divider' });
 
-  lines.push({ t: 'text', text: 'CELLS', bold: true });
+  if (!brief) lines.push({ t: 'text', text: 'CELLS', bold: true });
   if (st) {
     lines.push({ t: 'row', left: 'Lowest cell', right: `#${st.minIndex + 1}  ${volts(st.min)}` });
     lines.push({ t: 'row', left: 'Highest cell', right: `#${st.maxIndex + 1}  ${volts(st.max)}` });
-    lines.push({ t: 'row', left: 'Average', right: volts(st.avg) });
+    if (!brief) lines.push({ t: 'row', left: 'Average', right: volts(st.avg) });
     lines.push({ t: 'row', left: 'Delta (max-min)', right: num(st.delta, 0, 'mV') });
   } else {
     lines.push({ t: 'text', text: '- no cell data -' });
   }
-  if (cells.length) {
+  if (cells.length && !brief) {
     const grid = cellGrid(cells, st, b.balancingCells, width);
     lines.push({ t: 'blank', n: 1 });
     for (const row of grid.rows) lines.push({ t: 'text', text: row });
     for (const row of packBits(grid.legend, width)) lines.push({ t: 'text', text: row });
   }
+  if (cells.length && full) {
+    // полный чек: каждая банка отдельной строкой с отклонением и меткой балансировки
+    const bal = new Set(b.balancingCells ?? []);
+    lines.push({ t: 'blank', n: 1 });
+    for (const part of packBits(['CELL DETAIL', 'deviation from average', 'b = balancing'], width)) {
+      lines.push({ t: 'text', text: part });
+    }
+    cells.forEach((mv, i) => {
+      const dev = st ? Math.round(mv - st.avg) : null;
+      const devText = dev == null ? '' : `  ${dev > 0 ? '+' : ''}${dev} mV`;
+      lines.push({ t: 'text', text: `#${pad2(i + 1)}  ${volts(mv)}${devText}${bal.has(i + 1) ? '  b' : ''}` });
+    });
+  }
   lines.push({ t: 'divider' });
 
-  lines.push({ t: 'text', text: 'TEMPERATURES', bold: true });
+  if (!brief) lines.push({ t: 'text', text: 'TEMPERATURES', bold: true });
   if (T.length) {
-    T.forEach((t, i) => lines.push({ t: 'row', left: `Sensor T${i + 1}`, right: temp(t) }));
+    if (brief) {
+      lines.push({ t: 'row', left: 'Max temperature', right: temp(Math.max(...T)) });
+    } else {
+      T.forEach((t, i) => lines.push({ t: 'row', left: `Sensor T${i + 1}`, right: temp(t) }));
+      if (full && T.length > 1) lines.push({ t: 'row', left: 'High / low', right: `${temp(Math.max(...T))} / ${temp(Math.min(...T))}` });
+    }
   } else {
     lines.push({ t: 'text', text: '- no sensors -' });
   }
   lines.push({ t: 'divider' });
 
-  lines.push({ t: 'text', text: 'SWITCHES & PROTECTION', bold: true });
-  lines.push({ t: 'row', left: 'Charge FET', right: onOff(b.chargeFetOn) });
-  lines.push({ t: 'row', left: 'Discharge FET', right: onOff(b.dischargeFetOn) });
-  lines.push({ t: 'row', left: 'Balancing', right: b.balancingCells?.length ? plural(b.balancingCells.length, 'cell') : 'none' });
-  if (b.faults?.length) {
-    lines.push({ t: 'row', left: 'Protections', right: `${b.faults.length} ACTIVE`, bold: true });
-    for (const f of b.faults.slice(0, 13)) lines.push({ t: 'text', text: `! ${faultName(f)}` });
+  if (brief) {
+    // короткий чек: только счётчик защит и первые срабатывания
+    lines.push({ t: 'row', left: 'Protections', right: b.faults?.length ? `${b.faults.length} ACTIVE` : 'none active', bold: Boolean(b.faults?.length) });
+    for (const f of (b.faults ?? []).slice(0, 2)) lines.push({ t: 'text', text: `! ${faultName(f)}` });
   } else {
-    lines.push({ t: 'row', left: 'Protections', right: 'none active' });
+    lines.push({ t: 'text', text: 'SWITCHES & PROTECTION', bold: true });
+    lines.push({ t: 'row', left: 'Charge FET', right: onOff(b.chargeFetOn) });
+    lines.push({ t: 'row', left: 'Discharge FET', right: onOff(b.dischargeFetOn) });
+    lines.push({ t: 'row', left: 'Balancing', right: b.balancingCells?.length ? plural(b.balancingCells.length, 'cell') : 'none' });
+    if (b.faults?.length) {
+      lines.push({ t: 'row', left: 'Protections', right: `${b.faults.length} ACTIVE`, bold: true });
+      for (const f of b.faults.slice(0, 13)) lines.push({ t: 'text', text: `! ${faultName(f)}` });
+    } else {
+      lines.push({ t: 'row', left: 'Protections', right: 'none active' });
+    }
+    if (full && isNum(b.faultRaw)) {
+      lines.push({ t: 'row', left: 'Fault register', right: `0x${(b.faultRaw >>> 0).toString(16).padStart(4, '0')}` });
+    }
   }
   lines.push({ t: 'divider' });
 
-  if (b.hwVersion || b.swVersion || b.serial || b.prodDate) {
+  if (full) {
+    // счётчики срабатываний защит (регистр 0xAA): ненулевые — история платы
+    const counters = Object.entries(b.errors ?? {}).filter(([, v]) => isNum(v) && v > 0);
+    lines.push({ t: 'text', text: 'PROTECTION COUNTERS', bold: true });
+    if (counters.length) {
+      for (const [key, v] of counters) lines.push({ t: 'row', left: faultName({ key }), right: String(v) });
+    } else {
+      lines.push({ t: 'text', text: '- all zero -' });
+    }
+    lines.push({ t: 'divider' });
+  }
+
+  if (full && (b.hwVersion || b.swVersion || b.serial || b.prodDate)) {
     lines.push({ t: 'text', text: 'BOARD', bold: true });
     if (b.hwVersion) lines.push({ t: 'row', left: 'Hardware', right: b.hwVersion });
     if (b.swVersion) lines.push({ t: 'row', left: 'Firmware', right: b.swVersion });
@@ -603,13 +717,18 @@ function buildBankReceipt(b, fleet, width = 32) {
     lines.push({ t: 'divider' });
   }
 
-  if (fleet && fleet.banks > 1) {
+  if (fleet && fleet.banks > 1 && !brief) {
     lines.push({ t: 'text', text: `ALL BATTERIES: ${fleet.online}/${fleet.banks} ONLINE`, bold: true, align: 1 });
     lines.push({ t: 'row', left: 'Total current', right: num(fleet.currentSum, 2, 'A') });
     lines.push({ t: 'row', left: 'Total power', right: num(fleet.powerSum, 1, 'W') });
     lines.push({ t: 'row', left: 'Total remaining', right: ah(fleet.ahSum, fleet.ahCapacity, 1) });
     lines.push({ t: 'row', left: 'Max cell delta', right: num(fleet.cellDelta, 0, 'mV') });
     lines.push({ t: 'row', left: 'Max temperature', right: temp(fleet.tempMax) });
+    if (full) {
+      lines.push({ t: 'row', left: 'Balancing cells', right: String(fleet.balancing ?? 0) });
+      lines.push({ t: 'row', left: 'Cycles (max)', right: isNum(fleet.cyclesMax) ? String(fleet.cyclesMax) : 'n/a' });
+      lines.push({ t: 'row', left: 'FETs off chg/dsg', right: `${fleet.chargeFetOff ?? 0}/${fleet.dischargeFetOff ?? 0}` });
+    }
     lines.push({ t: 'divider' });
   }
 
@@ -619,11 +738,20 @@ function buildBankReceipt(b, fleet, width = 32) {
   return lines;
 }
 
-function buildFleetReceipt(rows, fleet, width = 32) {
+/**
+ * Чек по всем аккумуляторам (парку). Короткий — итоги и по одной строке на плату,
+ * средний — по три строки на плату, полный — плюс температуры, циклы, ключи,
+ * паспорт каждой платы и все активные защиты.
+ */
+function buildFleetReceipt(rows, fleet, width = 32, level = DEFAULT_REPORT_LEVEL) {
+  const lvl = levelOf(level);
+  const brief = lvl === 'short';
+  const full = lvl === 'full';
   const lines = [];
   lines.push({ t: 'text', text: 'ALL BATTERIES', align: 1, bold: true, size: 'big' });
   lines.push({ t: 'text', text: 'Summary report', align: 1, bold: true });
   lines.push({ t: 'divider' });
+  lines.push({ t: 'row', left: 'Report', right: lvl });
   lines.push({ t: 'row', left: 'Boards', right: String(fleet?.banks ?? rows.length) });
   lines.push({ t: 'row', left: 'Online', right: String(fleet?.online ?? rows.filter((r) => r.connected).length) });
   lines.push({ t: 'row', left: 'Offline', right: String(fleet?.stale ?? rows.filter((r) => !r.connected).length) });
@@ -635,17 +763,31 @@ function buildFleetReceipt(rows, fleet, width = 32) {
   lines.push({ t: 'row', left: 'Max cell delta', right: num(fleet?.cellDelta, 0, 'mV') });
   lines.push({ t: 'row', left: 'Max temperature', right: temp(fleet?.tempMax) });
   lines.push({ t: 'row', left: 'Active protections', right: String(fleet?.faults ?? 0) });
+  if (full) {
+    lines.push({ t: 'row', left: 'Max power', right: num(fleet?.powerMax, 1, 'W') });
+    lines.push({ t: 'row', left: 'Extreme cell V', right: `${volts(fleet?.cellMin)} / ${volts(fleet?.cellMax)}` });
+    lines.push({ t: 'row', left: 'Balancing cells', right: String(fleet?.balancing ?? 0) });
+    lines.push({ t: 'row', left: 'Cycles (max)', right: isNum(fleet?.cyclesMax) ? String(fleet.cyclesMax) : 'n/a' });
+    lines.push({ t: 'row', left: 'FETs off chg/dsg', right: `${fleet?.chargeFetOff ?? 0}/${fleet?.dischargeFetOff ?? 0}` });
+  }
   lines.push({ t: 'divider' });
 
   lines.push({ t: 'text', text: 'BATTERIES', bold: true });
   rows.forEach((b, i) => {
     const st = b.stats;
-    if (i > 0) lines.push({ t: 'blank', n: 1 });
-    lines.push({ t: 'text', text: `${b.label} - ${b.connected ? 'online' : 'OFFLINE'}`, bold: true });
+    if (i > 0 && !brief) lines.push({ t: 'blank', n: 1 });
+    lines.push({ t: 'text', text: `${i + 1}. ${b.label} - ${b.connected ? 'online' : 'OFFLINE'}`, bold: true });
     if (!isNum(b.voltage) && !isNum(b.current) && !st) {
       lines.push({ t: 'text', text: '- no data -' });
+    } else if (brief) {
+      // короткий чек: одна-две строки на плату — электрика и заряд
+      const facts = [
+        num(b.voltage, 2, 'V'), num(b.current, 2, 'A'),
+        `SOC ${num(b.soc, 0, '%')}`, st ? `delta ${st.delta} mV` : '',
+      ];
+      for (const s of packBits(facts, width)) lines.push({ t: 'text', text: s });
     } else {
-      // три смысловые строки: электрика · заряд и банки · крайние банки
+      // средний чек: три смысловые строки — электрика · заряд и банки · крайние банки
       const groups = [
         [num(b.voltage, 2, 'V'), num(b.current, 1, 'A'), num(b.power, 0, 'W')],
         [`SOC ${num(b.soc, 0, '%')}`, `${b.cellCount || b.cells?.length || 0}S`, st ? `delta ${st.delta} mV` : ''],
@@ -653,7 +795,24 @@ function buildFleetReceipt(rows, fleet, width = 32) {
       ];
       for (const g of groups) for (const s of packBits(g, width)) lines.push({ t: 'text', text: s });
     }
-    for (const f of b.faults ?? []) lines.push({ t: 'text', text: `! ${faultName(f)}` });
+    if (full) {
+      // полный чек: температуры, циклы, ключи и паспорт платы
+      const extra = [
+        b.temperatures?.length ? `T ${b.temperatures.map((t) => (isNum(t) ? t.toFixed(1) : 'n/a')).join('/')} C` : '',
+        `cycles ${isNum(b.cycles) ? b.cycles : 'n/a'}`,
+        `balancing ${b.balancingCells?.length ?? 0}`,
+        `chg FET ${onOff(b.chargeFetOn)}`,
+        `dsg FET ${onOff(b.dischargeFetOn)}`,
+        b.model ? `model ${b.model}` : '',
+        b.hwVersion ? `hw ${b.hwVersion}` : '',
+        b.swVersion ? `fw ${b.swVersion}` : '',
+        b.serial ? `sn ${b.serial}` : '',
+        b.prodDate ? `made ${isoDate(b.prodDate)}` : '',
+      ];
+      for (const s of packBits(extra, width)) lines.push({ t: 'text', text: s });
+    }
+    const faults = brief ? (b.faults ?? []).slice(0, 2) : (b.faults ?? []);
+    for (const f of faults) lines.push({ t: 'text', text: `! ${faultName(f)}` });
   });
   lines.push({ t: 'divider' });
   lines.push({ t: 'text', text: 'Printed by JBD BMS', align: 1 });

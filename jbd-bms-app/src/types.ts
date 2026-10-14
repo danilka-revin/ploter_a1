@@ -391,9 +391,15 @@ export interface PortsResponseExtended extends PortsResponse {
   ports: (PortItem & { used?: boolean })[];
 }
 
+/** Вид чека принтера: короткий, средний, полный. */
+export type ReportLevel = 'short' | 'medium' | 'full';
+
 export interface PrinterStatus {
   profile: 'plain' | 'escpos' | 'alexgyver';
   lineDelayMs: number;
+  /** вид чека по умолчанию: короткий (short), средний (medium), полный (full) */
+  reportLevel: ReportLevel;
+  reportLevels: ReportLevel[];
   printing: boolean;
   configured: boolean;
   path: string;
@@ -460,6 +466,8 @@ export interface PrinterSweepResult {
 /** Чек обычным текстом, как он ляжет на бумагу (GET /api/printer/preview). */
 export interface PrinterPreview {
   kind: 'bank' | 'fleet' | 'test';
+  /** вид чека: у пробной страницы его нет */
+  level: ReportLevel | null;
   width: number;
   lines: string[];
 }
@@ -471,4 +479,6 @@ export interface PrintResult {
   baudRate?: number;
   bank?: string;
   banks?: number;
+  /** каким видом чека напечатано: коротким, средним или полным */
+  level?: ReportLevel;
 }

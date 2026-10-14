@@ -425,6 +425,9 @@ html[data-theme='light'] body { background: #e9ecf1; }
 .printer-state { font-size: 11.5px; color: var(--text-2); display: inline-flex; gap: 5px; align-items: center; }
 .printer-state .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; box-shadow: 0 0 0 2px rgba(255,255,255,0.04); }
 .printer-main { display: flex; gap: 6px; align-items: center; }
+/* вид чека: короткий / средний / полный — выбранный подсвечен */
+.report-levels .chip { padding: 3px 10px; font-size: 11.5px; }
+.report-levels .chip:disabled { opacity: .45; cursor: default; }
 .printer-main select {
   flex: 1; min-width: 0; background: var(--surface-2); color: var(--text); border: 1px solid var(--line);
   border-radius: 8px; padding: 4px 7px; height: 28px; font-size: 11.5px;

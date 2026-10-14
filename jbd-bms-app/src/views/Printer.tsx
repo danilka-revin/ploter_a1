@@ -1,5 +1,6 @@
 // Плитка «Чековый принтер»: выбор UART-порта TTL-принтера, скорости,
-// кнопка «тестовая страница», предпросмотр чека и главная кнопка «Распечатать сводку».
+// вид чека (короткий / средний / полный), кнопка «тестовая страница»,
+// предпросмотр чека и главная кнопка «Распечатать сводку».
 // Чек на английском, только печатные ASCII-символы.
 // Мусор вместо текста (включая цифры и латиницу) — это несовпадение скорости
 // UART: «Найти скорость (авто)» перебирает скорости и форматы кадра и оставляет
@@ -7,9 +8,11 @@
 // для проверки по бумаге, если провод TX принтера не подключён.
 import { useEffect, useState } from 'react';
 import { api } from '../api';
+import { REPORT_LEVELS, reportLevelInfo, reportLevelKey } from '../printer-levels';
 import { Btn, Chip } from './Tile';
 import type {
   BankRow, PortItem, PrinterDetectResult, PrinterPreview, PrinterQueryResult, PrinterStatus, PrinterSweepResult,
+  ReportLevel,
 } from '../types';
 
 export function PrinterTile({
@@ -21,7 +24,7 @@ export function PrinterTile({
   busy: string | null;
   onConfig: (patch: Record<string, unknown>) => Promise<PrinterStatus | null>;
   onTest: () => Promise<void>;
-  onPrint: (id: string) => Promise<void>;
+  onPrint: (id: string, level?: ReportLevel) => Promise<void>;
   note: (kind: 'ok' | 'err' | 'info', text: string) => void;
 }) {
   const [status, setStatus] = useState<PrinterStatus | null>(null);
@@ -29,6 +32,8 @@ export function PrinterTile({
   const [baudRate, setBaudRate] = useState(9600);
   const [framing, setFraming] = useState('8N1');
   const [width, setWidth] = useState(32);
+  // вид чека: короткий, средний, полный — хранится в настройках принтера (printer.json)
+  const [level, setLevel] = useState<ReportLevel>('medium');
   const [pending, setPending] = useState(false);
   // какая длинная операция идёт: поиск скорости, перебор печатью или запрос состояния
   const [diagBusy, setDiagBusy] = useState<string | null>(null);
@@ -47,6 +52,7 @@ export function PrinterTile({
       setBaudRate(s.baudRate);
       setFraming(s.framing ?? '8N1');
       setWidth(s.width);
+      setLevel(reportLevelKey(s.reportLevel));
     } catch (e: any) {
       note('err', e.message ?? 'Не удалось прочитать статус принтера');
     }
@@ -57,25 +63,42 @@ export function PrinterTile({
   const printTarget = () => (allBanks ? 'all' : (focus && banks.find((b) => b.id === focus)?.id) || banks[0]?.id || '');
 
   /** Предпросмотр: сводка по выбранному аккумулятору (или парку), без банков — пробная страница. */
-  const loadPreview = async (target = printTarget() || 'test') => {
+  const loadPreview = async (target = printTarget() || 'test', lvl = level) => {
     try {
-      setPreview(await api<PrinterPreview>(`/api/printer/preview?id=${encodeURIComponent(target)}`));
+      const query = `/api/printer/preview?id=${encodeURIComponent(target)}&level=${encodeURIComponent(lvl)}`;
+      setPreview(await api<PrinterPreview>(query));
     } catch (e: any) {
       note('err', e.message ?? 'Не удалось показать чек');
     }
   };
 
-  // открытый предпросмотр следует за выбором аккумулятора / «все банки»
+  // открытый предпросмотр следует за выбором аккумулятора / «все банки» / видов чека
   useEffect(() => {
     if (preview && preview.kind !== 'test') loadPreview();
-  }, [allBanks, focus]); // eslint-disable-line
+  }, [allBanks, focus, level]); // eslint-disable-line
 
   const applyCfg = async (patch: Record<string, unknown>) => {
     setPending(true);
     try {
       const s = await onConfig(patch);
-      if (s) { setStatus(s); setPath(s.path); setBaudRate(s.baudRate); setFraming(s.framing ?? '8N1'); setWidth(s.width); }
+      if (s) {
+        setStatus(s); setPath(s.path); setBaudRate(s.baudRate);
+        setFraming(s.framing ?? '8N1'); setWidth(s.width); setLevel(reportLevelKey(s.reportLevel));
+      }
       if (s && preview) loadPreview(preview.kind === 'test' ? 'test' : undefined);
+    } finally { setPending(false); }
+  };
+
+  /** Вид чека: сразу сохраняется в printer.json, поэтому Ctrl+P печатает тем же видом. */
+  const applyLevel = async (next: ReportLevel) => {
+    if (next === level) return;
+    setLevel(next);
+    const info = reportLevelInfo(next);
+    setPending(true);
+    try {
+      const s = await onConfig({ reportLevel: next });
+      if (s) setLevel(reportLevelKey(s.reportLevel));
+      note('info', `Чек: ${info.label} — ${info.summary}.`);
     } finally { setPending(false); }
   };
 
@@ -144,11 +167,13 @@ export function PrinterTile({
     if (!path) { note('err', 'Сначала выберите порт принтера.'); return; }
     const target = printTarget();
     if (!target) { note('err', 'Нет подключённых аккумуляторов для печати.'); return; }
-    await onPrint(target);
+    await onPrint(target, level);
     refresh();
   };
 
   const selectedBank = (focus && banks.find((b) => b.id === focus)) || banks[0] || null;
+  const levelInfo = reportLevelInfo(level);
+  const levelShown = preview?.level ? reportLevelInfo(preview.level) : levelInfo;
   const configured = Boolean(path);
   // порт принтера занят платой: опрос BMS каждую секунду печатает кадры dd a5 03 … вместо чека
   const portBusy = Boolean(status?.busy);
@@ -162,7 +187,7 @@ export function PrinterTile({
           принтер: {stateText}
         </span>
         <span className="muted tiny" title="Скорость, формат кадра и протокол должны совпадать с моделью принтера">
-          {baudRate} {framing} · чек на английском
+          {baudRate} {framing} · чек на английском · вид: {levelInfo.label}
         </span>
         <button type="button" className="linkish small" onClick={() => setExpanded((v) => !v)}>
           {expanded ? 'свернуть ▴' : 'настроить ▾'}
@@ -177,6 +202,25 @@ export function PrinterTile({
           </button>
         </div>
       )}
+
+      {/* Вид чека: три отчёта одной кнопкой — короткий, средний и полный. */}
+      <div className="printer-row">
+        <span className="muted tiny">вид чека:</span>
+        <span className="chips report-levels" role="group" aria-label="Вид чека">
+          {REPORT_LEVELS.map((l) => (
+            <Chip
+              key={l.key}
+              on={level === l.key}
+              disabled={locked}
+              onClick={() => applyLevel(l.key)}
+              title={l.hint}
+            >
+              {l.label}
+            </Chip>
+          ))}
+        </span>
+        <span className="muted tiny" title={levelInfo.hint}>{levelInfo.summary}</span>
+      </div>
 
       <div className="printer-main">
         <select
@@ -198,9 +242,9 @@ export function PrinterTile({
           className="b primary print-btn"
           onClick={doPrint}
           disabled={!configured || locked || !banks.length}
-          title={`Распечатать чек (на английском) со сводкой по ${allBanks ? 'всему парку' : (selectedBank?.label ?? 'аккумулятору')}`}
+          title={`Распечатать ${levelInfo.label} чек (на английском) со сводкой по ${allBanks ? 'всему парку' : (selectedBank?.label ?? 'аккумулятору')}. ${levelInfo.hint}`}
         >
-          🖶 {busy === 'printer' ? 'Печать…' : `Печать сводки${allBanks ? ' (все)' : ''}`}
+          🖶 {busy === 'printer' ? 'Печать…' : `Печать: ${levelInfo.label}`}
         </button>
       </div>
 
@@ -248,7 +292,7 @@ export function PrinterTile({
         <div className="printer-preview">
           <div className="printer-row">
             <span className="muted tiny">
-              так чек ляжет на бумагу · {preview.width} симв. в строке · английский, ASCII
+              так чек ляжет на бумагу · {levelShown.label} · {preview.lines.length} строк · {preview.width} симв. в строке · английский, ASCII
             </span>
             <button type="button" className="linkish small" onClick={() => loadPreview(preview.kind === 'test' ? 'test' : undefined)}>обновить</button>
           </div>
