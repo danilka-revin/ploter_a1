@@ -6,7 +6,7 @@
 // совпадения скорости UART и протокола; ASCII сам по себе это не гарантирует. Подписи банков, имена плат и т. п. из
 // данных приводятся к ASCII транслитом.
 
-import { ReceiptPrinter, PRINTER_BAUDS, renderReceiptText, toPrinterText, PRINTER_PROFILES, plainReceipt } from './printer.mjs';
+import { ReceiptPrinter, PRINTER_BAUDS, renderReceiptText, toPrinterText, PRINTER_PROFILES, PRINTER_FRAMINGS, STATUS_QUERIES, describeStatusByte, plainReceipt } from './printer.mjs';
 
 import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 
@@ -22,6 +22,7 @@ const DEFAULTS = {
   path: process.env.BMS_PRINTER_PORT || '',
   baudRate: PRINTER_BAUDS.includes(envBaud) ? envBaud : 9600,
   width: Number.isInteger(envWidth) && envWidth >= WIDTH_MIN && envWidth <= WIDTH_MAX ? envWidth : 32,
+  framing: PRINTER_FRAMINGS.includes(process.env.BMS_PRINTER_FRAMING || '') ? process.env.BMS_PRINTER_FRAMING : '8N1',
 };
 
 export class PrinterService {
@@ -53,6 +54,7 @@ export class PrinterService {
       configured: Boolean(this.config.path),
       path: this.config.path || '',
       baudRate: this.config.baudRate,
+      framing: this.config.framing,
       width: this.config.width,
       profile: this.config.profile,
       lineDelayMs: this.config.lineDelayMs,
@@ -64,6 +66,7 @@ export class PrinterService {
       lastError: this.lastError,
       lastPrintAt: this.lastPrintAt,
       bauds: PRINTER_BAUDS,
+      framings: PRINTER_FRAMINGS,
     };
   }
 
@@ -72,12 +75,20 @@ export class PrinterService {
     if (patch.profile !== undefined) {
       if (!PRINTER_PROFILES.includes(patch.profile)) throw svcError(400, 'BAD_PROFILE', 'Неизвестный профиль принтера.');
     }
+    if (patch.framing !== undefined) {
+      if (!PRINTER_FRAMINGS.includes(patch.framing)) throw svcError(400, 'BAD_FRAMING', 'Неизвестный формат кадра: выберите 8N1, 8E1 или 7E1.');
+    }
     if (patch.lineDelayMs !== undefined) {
       const ms = Number(patch.lineDelayMs);
       if (!Number.isInteger(ms) || ms < 0 || ms > 2000) throw svcError(400, 'BAD_DELAY', 'Пауза должна быть от 0 до 2000 мс.');
       this.config.lineDelayMs = ms;
     }
     if (patch.profile !== undefined) this.config.profile = patch.profile;
+    if (patch.framing !== undefined && patch.framing !== this.config.framing) {
+      // формат кадра меняет открытие порта — закрываем старый, откроется заново
+      if (this.printer) { this._closing = this.printer.close().catch(() => {}); this.printer = null; }
+      this.config.framing = patch.framing;
+    }
     if (typeof patch.path === 'string') {
       const next = String(patch.path || '').trim();
       if (this.printer && (next !== this.config.path || !next)) {
@@ -100,12 +111,16 @@ export class PrinterService {
       const w = Number(patch.width);
       if (Number.isInteger(w) && w >= WIDTH_MIN && w <= WIDTH_MAX) this.config.width = w;
     }
-    if (persist && this.configFile) {
-      writeFileSync(this.configFile + '.tmp', JSON.stringify(this.config, null, 2) + '\n');
-      renameSync(this.configFile + '.tmp', this.configFile);
-    }
-    this.log(`конфигурация: ${this.config.path || '(не выбран)'} @ ${this.config.baudRate}, ширина ${this.config.width}, чек на английском (ASCII)`);
+    if (persist) this._persist();
+    this.log(`конфигурация: ${this.config.path || '(не выбран)'} @ ${this.config.baudRate} ${this.config.framing}, ширина ${this.config.width}, чек на английском (ASCII)`);
     return this.status();
+  }
+
+  /** Сохранить настройки на диск (рядом с package.json, файл игнорируется Git). */
+  _persist() {
+    if (!this.configFile) return;
+    writeFileSync(this.configFile + '.tmp', JSON.stringify(this.config, null, 2) + '\n');
+    renameSync(this.configFile + '.tmp', this.configFile);
   }
 
   _ensure() {
@@ -115,11 +130,13 @@ export class PrinterService {
         `Порт ${this.config.path} занят платой (банком): опрос BMS печатается на принтере и мешает чеку. `
         + 'Отключите этот банк или выберите принтеру другой порт.');
     }
-    if (!this.printer || this.printer.path !== this.config.path || this.printer.baudRate !== this.config.baudRate) {
+    if (!this.printer || this.printer.path !== this.config.path
+      || this.printer.baudRate !== this.config.baudRate || this.printer.framing !== this.config.framing) {
       this.printer = new ReceiptPrinter({
         path: this.config.path,
         baudRate: this.config.baudRate,
         width: this.config.width,
+        framing: this.config.framing,
       });
     }
     // ширина могла поменяться после первой печати — порт ради этого не переоткрываем
@@ -127,6 +144,158 @@ export class PrinterService {
     this.printer.profile = this.config.profile;
     this.printer.lineDelayMs = this.config.lineDelayMs;
     return this.printer;
+  }
+
+  /**
+   * «Мусор вместо текста» на бумаге почти всегда значит, что не совпала
+   * скорость UART: принтер читает наши байты как чужие и печатает ерунду,
+   * включая цифры и латиницу. Автопоиск перебирает скорости и форматы кадра
+   * и спрашивает у принтера состояние (ESC v 0 / GS r / DLE EOT): ответ есть
+   * только на «своей» скорости. Бумага почти не расходуется — команды статуса
+   * не печатают (на чужой скорости принтер может выдать пару мусорных знаков).
+   */
+  async detectBaud({ bauds = PRINTER_BAUDS, framings = PRINTER_FRAMINGS, timeoutMs = 150 } = {}) {
+    if (this.printing) throw svcError(409, 'PRINTER_BUSY', 'Принтер уже печатает.');
+    const p = this._ensure();
+    const baudList = (Array.isArray(bauds) ? bauds.filter((b) => PRINTER_BAUDS.includes(b)) : []).length ? bauds : PRINTER_BAUDS;
+    const framingList = (Array.isArray(framings) ? framings.filter((f) => PRINTER_FRAMINGS.includes(f)) : []).length ? framings : PRINTER_FRAMINGS;
+    const wait = Math.max(10, Number(timeoutMs) || 150);
+    this.printing = true;
+    const hits = [];
+    let tried = 0;
+    try {
+      await this._closing;
+      await p.open();
+      for (const framing of framingList) {
+        for (const baudRate of baudList) {
+          tried++;
+          await p.setLine({ baudRate, framing });
+          // сначала самый частый запрос: на чужой скорости каждый лишний запрос — мусор на бумаге
+          let answer = await p.queryStatus({ queries: [STATUS_QUERIES[0]], timeoutMs: wait });
+          if (!answer.bytes.length) answer = await p.queryStatus({ queries: STATUS_QUERIES.slice(1), timeoutMs: Math.max(10, Math.round(wait * 0.8)) });
+          if (!answer.bytes.length) continue;
+          const confirm = await p.queryStatus({ queries: [STATUS_QUERIES[0]], timeoutMs: wait });
+          hits.push({
+            baudRate,
+            framing,
+            byte: answer.bytes[0],
+            hex: answer.hex,
+            query: answer.query,
+            status: describeStatusByte(answer.bytes[0]),
+            confirmed: confirm.bytes.length > 0 && confirm.bytes[0] === answer.bytes[0],
+          });
+          break;   // нашли рабочие настройки — остальные скорости не нужны
+        }
+        if (hits.length) break;
+      }
+    } catch (e) {
+      this.lastError = e.message;
+      throw svcError(502, 'DETECT_FAILED', `Автопоиск скорости: ${e.message}`);
+    } finally {
+      const best = hits.find((h) => h.confirmed && h.status?.plausible)
+        ?? hits.find((h) => h.status?.plausible) ?? hits[0];
+      if (best) {
+        this.config.baudRate = best.baudRate;
+        this.config.framing = best.framing;
+        this._persist();
+        this.log(`рабочая скорость ${best.baudRate} ${best.framing} (ответ ${best.hex || best.byte}) — сохранена`);
+      }
+      if (this.printer) {
+        this.printer.baudRate = this.config.baudRate;
+        this.printer.framing = this.config.framing;
+        await this.printer.setLine({ baudRate: this.config.baudRate, framing: this.config.framing }).catch(() => {});
+      }
+      this.printing = false;
+    }
+    const best = hits[0] ?? null;
+    if (best) this.lastError = '';
+    return {
+      ok: Boolean(best),
+      tried,
+      hits,
+      baudRate: this.config.baudRate,
+      framing: this.config.framing,
+      found: Boolean(best),
+      message: best
+        ? `Принтер ответил на ${best.baudRate} ${best.framing} (${best.hex}). Скорость и формат кадра сохранены — нажмите «Пробная страница».`
+        : `Принтер не ответил ни на одной из ${tried} комбинаций скорости и формата кадра. `
+          + 'Проверьте: TX принтера → RX адаптера (без этого ответа не будет), общий GND, '
+          + 'что модуль именно TTL, а не RS-232 (у RS-232 уровни ±5 В — нужен преобразователь MAX3232/SP3232). '
+          + 'Если провод TX не подключён, нажмите «Печатать на всех скоростях» и посмотрите, какой блок на бумаге читается.',
+    };
+  }
+
+  /**
+   * Напечатать короткий блок на каждой скорости: на бумаге находится один
+   * читаемый блок — это и есть скорость принтера. Нужен тем, у кого не
+   * подключён TX принтера (ответ на запрос статуса не приходит).
+   */
+  async sweepBauds({ bauds = PRINTER_BAUDS, paceMs = 250 } = {}) {
+    if (this.printing) throw svcError(409, 'PRINTER_BUSY', 'Принтер уже печатает.');
+    const p = this._ensure();
+    const baudList = (Array.isArray(bauds) ? bauds.filter((b) => PRINTER_BAUDS.includes(b)) : []).length ? bauds : PRINTER_BAUDS;
+    this.printing = true;
+    const before = { baudRate: this.config.baudRate, framing: this.config.framing };
+    const prevDelay = p.lineDelayMs;
+    const printed = [];
+    try {
+      await this._closing;
+      await p.open();
+      // на каждой скорости блок печатается целиком: пауза не даёт буферу принтера переполниться
+      p.lineDelayMs = Math.max(0, Number(paceMs) || 0, this.config.lineDelayMs);
+      for (const baudRate of baudList) {
+        await p.setLine({ baudRate, framing: this.config.framing });
+        await p.printLines(baudSweepLines(baudRate, this.config.framing), this.config.width);
+        printed.push(baudRate);
+      }
+    } catch (e) {
+      this.lastError = e.message;
+      throw svcError(502, 'SWEEP_FAILED', `Перебор скоростей: ${e.message}`);
+    } finally {
+      p.lineDelayMs = prevDelay;
+      await p.setLine(before).catch(() => {});
+      this.printing = false;
+    }
+    return {
+      ok: true,
+      printed,
+      baudRate: before.baudRate,
+      framing: before.framing,
+      message: `Напечатано ${printed.length} блоков по 2 строки. Найдите блок, который читается, и выберите его скорость в списке «скорость UART», затем нажмите «Пробная страница». `
+        + 'Если читаемого блока нет ни на одной скорости — дело не в скорости: проверьте GND, TTL против RS-232 и пайку провода RX принтера.',
+    };
+  }
+
+  /** Спросить состояние принтера на текущих настройках (бумага, ошибки). */
+  async queryPrinter({ timeoutMs = 250 } = {}) {
+    if (this.printing) throw svcError(409, 'PRINTER_BUSY', 'Принтер уже печатает.');
+    const p = this._ensure();
+    this.printing = true;
+    try {
+      await this._closing;
+      await p.open();
+      const r = await p.queryStatus({ timeoutMs });
+      const st = r.status;
+      if (r.bytes.length) this.lastError = '';
+      return {
+        ok: r.bytes.length > 0,
+        at: Date.now(),
+        baudRate: this.config.baudRate,
+        framing: this.config.framing,
+        query: r.query,
+        byte: r.bytes.length ? r.bytes[0] : null,
+        hex: r.hex,
+        paper: st ? (st.paperOut ? 'out' : 'ok') : 'unknown',
+        status: st,
+        message: r.bytes.length
+          ? `Принтер ответил на ${this.config.baudRate} ${this.config.framing}: ${st.text}. Значит, скорость и провод TX принтера в порядке — печатайте чек.`
+          : `На ${this.config.baudRate} ${this.config.framing} принтер молчит. Нажмите «Найти скорость» (перебор всех скоростей) `
+            + 'или «Печатать на всех скоростях». Ответа не будет и тогда, когда не подключён TX принтера → RX адаптера.',
+      };
+    } catch (e) {
+      this.lastError = e.message;
+      throw svcError(502, 'QUERY_FAILED', `Запрос состояния принтера: ${e.message}`);
+    } finally { this.printing = false; }
   }
 
   // Короткий тест транспорта: ни ESC, ни нагрев, ни выбор кодовой страницы.
@@ -349,6 +518,19 @@ function buildTestPage({ path, baudRate, width }) {
   ];
 }
 
+/**
+ * Блок для перебора скоростей: на «своей» скорости текст читается, на чужой
+ * выходит мусор — по бумаге видно, какая строка настоящая.
+ */
+function baudSweepLines(baudRate, framing) {
+  return [
+    { t: 'divider', ch: '=' },
+    { t: 'text', text: `${baudRate} ${framing}`, align: 1, bold: true },
+    { t: 'text', text: 'Hello 123 ABC abc +-*/' },
+    { t: 'feed', n: 2 },
+  ];
+}
+
 function buildBankReceipt(b, fleet, width = 32) {
   const st = b.stats;
   const T = b.temperatures || [];
@@ -487,4 +669,4 @@ function svcError(status, code, message) {
   return e;
 }
 
-export { buildBankReceipt, buildFleetReceipt, buildTestPage, PRINTER_BAUDS };
+export { buildBankReceipt, buildFleetReceipt, buildTestPage, baudSweepLines, PRINTER_BAUDS };

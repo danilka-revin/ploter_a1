@@ -398,6 +398,8 @@ export interface PrinterStatus {
   configured: boolean;
   path: string;
   baudRate: number;
+  /** формат кадра UART: 8N1 (обычный), 8E1, 7E1 */
+  framing: string;
   width: number;
   /** язык чека: английский, ASCII; требуется совместимый транспорт/протокол */
   language: 'en';
@@ -405,10 +407,54 @@ export interface PrinterStatus {
   lastError: string;
   lastPrintAt: number;
   bauds: number[];
+  framings: string[];
   /** порт отдан принтеру, но на нём висит плата (опрос печатается вместо чека) */
   busy: boolean;
   /** порт, который пришлось освободить от банка, когда его отдали принтеру */
   freedPort?: string;
+}
+
+/** Ответ принтера на запрос состояния (POST /api/printer/query). */
+export interface PrinterQueryResult {
+  ok: boolean;
+  at: number;
+  baudRate: number;
+  framing: string;
+  query: string;
+  byte: number | null;
+  hex: string;
+  paper: 'ok' | 'out' | 'unknown';
+  status: { text: string; plausible: boolean; paperOut: boolean; error: boolean; hex: string } | null;
+  message: string;
+}
+
+/** Найденные рабочие настройки линии (POST /api/printer/detect). */
+export interface PrinterHit {
+  baudRate: number;
+  framing: string;
+  byte: number;
+  hex: string;
+  query: string;
+  confirmed: boolean;
+  status: { text: string; plausible: boolean; paperOut: boolean; hex: string };
+}
+
+export interface PrinterDetectResult {
+  ok: boolean;
+  found: boolean;
+  tried: number;
+  hits: PrinterHit[];
+  baudRate: number;
+  framing: string;
+  message: string;
+}
+
+export interface PrinterSweepResult {
+  ok: boolean;
+  printed: number[];
+  baudRate: number;
+  framing: string;
+  message: string;
 }
 
 /** Чек обычным текстом, как он ляжет на бумагу (GET /api/printer/preview). */

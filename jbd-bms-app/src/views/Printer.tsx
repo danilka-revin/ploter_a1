@@ -1,11 +1,16 @@
 // Плитка «Чековый принтер»: выбор UART-порта TTL-принтера, скорости,
 // кнопка «тестовая страница», предпросмотр чека и главная кнопка «Распечатать сводку».
 // Чек на английском, только печатные ASCII-символы.
-// Кодировка не исправляет несовпадение скорости UART или протокола.
+// Мусор вместо текста (включая цифры и латиницу) — это несовпадение скорости
+// UART: «Найти скорость (авто)» перебирает скорости и форматы кадра и оставляет
+// ту, на которой принтер отвечает; «Печатать на всех скоростях» печатает блоки
+// для проверки по бумаге, если провод TX принтера не подключён.
 import { useEffect, useState } from 'react';
 import { api } from '../api';
 import { Btn, Chip } from './Tile';
-import type { BankRow, PortItem, PrinterPreview, PrinterStatus } from '../types';
+import type {
+  BankRow, PortItem, PrinterDetectResult, PrinterPreview, PrinterQueryResult, PrinterStatus, PrinterSweepResult,
+} from '../types';
 
 export function PrinterTile({
   ports, banks, focus, busy, onConfig, onTest, onPrint, note,
@@ -22,12 +27,17 @@ export function PrinterTile({
   const [status, setStatus] = useState<PrinterStatus | null>(null);
   const [path, setPath] = useState('');
   const [baudRate, setBaudRate] = useState(9600);
+  const [framing, setFraming] = useState('8N1');
   const [width, setWidth] = useState(32);
   const [pending, setPending] = useState(false);
-  const locked = busy != null || pending;
+  // какая длинная операция идёт: поиск скорости, перебор печатью или запрос состояния
+  const [diagBusy, setDiagBusy] = useState<string | null>(null);
+  const locked = busy != null || pending || diagBusy != null;
   const [allBanks, setAllBanks] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [preview, setPreview] = useState<PrinterPreview | null>(null);
+  const [detect, setDetect] = useState<PrinterDetectResult | null>(null);
+  const [diag, setDiag] = useState<{ kind: 'ok' | 'err' | 'info'; text: string; extra?: string[] } | null>(null);
 
   const refresh = async () => {
     try {
@@ -35,6 +45,7 @@ export function PrinterTile({
       setStatus(s);
       setPath(s.path);
       setBaudRate(s.baudRate);
+      setFraming(s.framing ?? '8N1');
       setWidth(s.width);
     } catch (e: any) {
       note('err', e.message ?? 'Не удалось прочитать статус принтера');
@@ -63,7 +74,7 @@ export function PrinterTile({
     setPending(true);
     try {
       const s = await onConfig(patch);
-      if (s) { setStatus(s); setPath(s.path); setBaudRate(s.baudRate); setWidth(s.width); }
+      if (s) { setStatus(s); setPath(s.path); setBaudRate(s.baudRate); setFraming(s.framing ?? '8N1'); setWidth(s.width); }
       if (s && preview) loadPreview(preview.kind === 'test' ? 'test' : undefined);
     } finally { setPending(false); }
   };
@@ -72,10 +83,55 @@ export function PrinterTile({
     setPending(true);
     try {
       await api('/api/printer/diagnostic', { method: 'POST' }, 15_000);
-      note('info', 'Тест отправлен. На бумаге должно быть Hello 123 ABC abc. Нечитаемо — сверьте скорость по самотесту принтера.');
+      note('info', 'Тест отправлен. На бумаге должно быть Hello 123 ABC abc. Нечитаемо — нажмите «Найти скорость (авто)».');
       await refresh();
     } catch (e: any) { note('err', e.message); }
     finally { setPending(false); }
+  };
+
+  /** Спросить у принтера состояние: ответ доказывает, что скорость и TX в порядке. */
+  const queryPrinter = async () => {
+    setDiagBusy('query');
+    try {
+      const r = await api<PrinterQueryResult>('/api/printer/query', { method: 'POST' }, 30_000);
+      setDiag({ kind: r.ok ? 'ok' : 'info', text: r.message });
+      note(r.ok ? 'ok' : 'info', r.message);
+      await refresh();
+    } catch (e: any) { setDiag({ kind: 'err', text: e.message }); note('err', e.message); }
+    finally { setDiagBusy(null); }
+  };
+
+  /** Автопоиск скорости: принтер отвечает только на «своей» скорости UART. */
+  const findBaud = async () => {
+    if (!path) { note('err', 'Сначала выберите порт принтера.'); return; }
+    setDiagBusy('detect');
+    setDetect(null);
+    try {
+      const r = await api<PrinterDetectResult>('/api/printer/detect', { method: 'POST' }, 180_000);
+      setDetect(r);
+      setDiag({
+        kind: r.found ? 'ok' : 'info',
+        text: r.message,
+        extra: r.hits.map((h) => `${h.baudRate} ${h.framing} · ответ ${h.hex} (${h.query})${h.confirmed ? '' : ' · без подтверждения'}`),
+      });
+      if (r.found) { setBaudRate(r.baudRate); setFraming(r.framing); }
+      note(r.found ? 'ok' : 'info', r.message);
+      await refresh();
+    } catch (e: any) { setDiag({ kind: 'err', text: e.message }); note('err', e.message); }
+    finally { setDiagBusy(null); }
+  };
+
+  /** Перебор скоростей печатью: на бумаге ищем читаемый блок (нужно, если нет TX принтера). */
+  const sweepBauds = async () => {
+    if (!path) { note('err', 'Сначала выберите порт принтера.'); return; }
+    setDiagBusy('sweep');
+    try {
+      const r = await api<PrinterSweepResult>('/api/printer/sweep', { method: 'POST' }, 300_000);
+      setDiag({ kind: 'info', text: r.message, extra: r.printed.map((b) => `${b} ${r.framing}`) });
+      note('info', 'Блоки напечатаны — найдите на бумаге читаемый.');
+      await refresh();
+    } catch (e: any) { setDiag({ kind: 'err', text: e.message }); note('err', e.message); }
+    finally { setDiagBusy(null); }
   };
 
   const doTest = async () => {
@@ -105,7 +161,9 @@ export function PrinterTile({
           <i className="dot" style={{ background: portBusy ? 'var(--danger)' : (!status?.configured ? 'var(--warn)' : (status?.open ? 'var(--ok)' : 'var(--text-2)')) }} />
           принтер: {stateText}
         </span>
-        <span className="muted tiny" title="Для читаемого чека должны совпадать скорость UART и протокол принтера">чек на английском</span>
+        <span className="muted tiny" title="Скорость, формат кадра и протокол должны совпадать с моделью принтера">
+          {baudRate} {framing} · чек на английском
+        </span>
         <button type="button" className="linkish small" onClick={() => setExpanded((v) => !v)}>
           {expanded ? 'свернуть ▴' : 'настроить ▾'}
         </button>
@@ -145,6 +203,26 @@ export function PrinterTile({
           🖶 {busy === 'printer' ? 'Печать…' : `Печать сводки${allBanks ? ' (все)' : ''}`}
         </button>
       </div>
+
+      <div className="printer-row">
+        <span className="muted tiny">на бумаге мусор вместо текста?</span>
+        <Btn small tone="primary" onClick={findBaud} disabled={!configured || locked} title="Перебрать 9600/19200/38400/57600/115200 и 8N1/8E1/7E1: принтер отвечает только на своей скорости">
+          {diagBusy === 'detect' ? 'Ищу скорость…' : 'Найти скорость (авто)'}
+        </Btn>
+        <button type="button" className="linkish small" onClick={sweepBauds} disabled={!configured || locked} title="Напечатать короткие блоки на всех скоростях — читаемый блок покажет скорость принтера">
+          {diagBusy === 'sweep' ? 'печатаю блоки…' : 'печатать на всех скоростях'}
+        </button>
+        <button type="button" className="linkish small" onClick={queryPrinter} disabled={!configured || locked} title="Спросить у принтера состояние: ответ доказывает, что скорость и TX принтера в порядке">
+          {diagBusy === 'query' ? 'спрашиваю…' : 'состояние принтера'}
+        </button>
+      </div>
+
+      {diag && (
+        <div className={`banner ${diag.kind === 'ok' ? 'ok' : diag.kind === 'err' ? 'err' : 'info'} small`}>
+          {diag.text}
+          {diag.extra?.length ? <ul className="diag-list">{diag.extra.map((x) => <li key={x}>{x}</li>)}</ul> : null}
+        </div>
+      )}
 
       <div className="printer-row">
         <Chip on={allBanks} onClick={() => setAllBanks(!allBanks)} title="Распечатать сводку по всем подключённым платам одним чеком">
@@ -200,9 +278,15 @@ export function PrinterTile({
             <label className="printer-field">
               <span>скорость UART</span>
               <select value={baudRate} onChange={(e) => applyCfg({ baudRate: Number(e.target.value) })} disabled={locked}>
-                {(status?.bauds ?? [9600, 19200, 38400, 57600, 115200]).map((b) => (
+                {(status?.bauds ?? [9600, 19200, 38400, 57600, 115200, 4800, 2400]).map((b) => (
                   <option key={b} value={b}>{b} бод</option>
                 ))}
+              </select>
+            </label>
+            <label className="printer-field">
+              <span>кадр</span>
+              <select value={framing} onChange={(e) => applyCfg({ framing: e.target.value })} disabled={locked} title="8N1 — у большинства модулей; 8E1 и 7E1 — у части китайских">
+                {(status?.framings ?? ['8N1', '8E1', '7E1']).map((f) => <option key={f} value={f}>{f}</option>)}
               </select>
             </label>
             <label className="printer-field">
@@ -220,22 +304,34 @@ export function PrinterTile({
               {busy === 'printer-test' ? 'Печать…' : 'Пробная страница'}
             </Btn>
             <button type="button" className="linkish small" onClick={() => loadPreview('test')} title="Показать пробную страницу на экране">как она выглядит</button>
-            <span className="muted tiny">TTL UART · 5–9В питание (VH) · 8N1 · чек на английском (ASCII)</span>
+            <span className="muted tiny">TTL UART · 5–9В питание (VH) · {framing} · чек на английском (ASCII)</span>
           </div>
           {status?.lastError && <div className="banner err small">{status.lastError}</div>}
+          {detect && !detect.found && (
+            <div className="banner info small">
+              Проверено комбинаций: {detect.tried}. Ни одна не ответила — {detect.message}
+            </div>
+          )}
           <p className="muted tiny">
-            Начните с «Простой текст» и «Тест Hello 123». Этот тест не отправляет команды шрифта,
-            нагрева или кодировки. Если даже цифры нечитаемы, сверьте UART baud и 8N1 с самотестом
-            принтера (обычно включение с зажатой кнопкой FEED; смотрите инструкцию модели).
-            Выбирайте скорости по одной, после каждого теста проверяйте бумагу. Без обратной связи
-            нельзя автоматически определить читаемость. Если тест читаемый, но длинный чек повреждается,
-            увеличьте паузу до 800–2000 мс и проверьте питание. Затем можно попробовать ESC/POS;
-            AlexGyver выбирайте только для совместимого TTL-принтера. Порт принтера исключён из опроса BMS.
+            <b>Если на бумаге мусор вместо букв и цифр</b> — это не текст и не кодировка, а линия: принтер читает
+            байты на другой скорости. Нажмите <b>«Найти скорость (авто)»</b>: приложение переберёт 9600/19200/38400/
+            57600/115200 и форматы кадра 8N1/8E1/7E1 и оставит ту комбинацию, на которой принтер отвечает
+            (команды состояния не печатаются, бумага почти не тратится). Провод TX принтера → RX адаптера
+            нужен только для этого автоответа. Если он не подключён, нажмите <b>«печатать на всех скоростях»</b> —
+            на бумаге будет несколько блоков, читаемый блок и есть скорость вашего принтера (например, 19200
+            вместо 9600). Потом нажмите «Пробная страница».
+          </p>
+          <p className="muted tiny">
+            Если читаемого текста нет ни на одной скорости, ни на одном формате кадра — скорость тут не при чём.
+            Проверьте: общий GND, TX→RX (их часто путают: TX адаптера → RX принтера, RX адаптера → TX принтера),
+            уровень и тип интерфейса — модули бывают TTL и RS-232 (±5 В), для RS-232 нужен преобразователь
+            MAX3232/SP3232. Тип бумаги и питание 5–9 В (VH) тоже влияют: слабое питание даёт бледные или
+            «рваные» строки, но не мусор.
           </p>
           <p className="muted tiny">
             Подключение: GND принтера к GND адаптера, TX принтера к RX адаптера, RX принтера к TX адаптера.
-            Уровень логики и питание сверяйте с паспортом модели: TTL и RS-232 электрически несовместимы. Принтер подключается на отдельный
-            USB-UART адаптер параллельно BMS.
+            Принтер подключается на отдельный USB-UART адаптер параллельно BMS; скорость и формат кадра
+            сохраняются в printer.json и переживают перезапуск.
           </p>
         </div>
       )}
