@@ -69,23 +69,42 @@ export default function App() {
     return () => { clearTimeout(first); clearInterval(every); };
   }, [checkUpdate]);
   const runUpdate = useCallback(async () => {
-    try { setUpdate(await api<UpdateSnapshot>('/update/run', { method: 'POST' })); } catch { /* причина в журнале */ }
-  }, []);
+    try {
+      setHealth(await api<Health>('/healthz'));
+      setUpdate(await api<UpdateSnapshot>('/update/run', { method: 'POST' }));
+    } catch (e: any) { cockpit.note('err', e.message || 'Не удалось запустить обновление'); }
+  }, [cockpit.note]);
   useEffect(() => {
     if (!update || (update.phase !== 'running' && !update.running)) return;
     const id = setInterval(async () => {
-      try { setUpdate(await api<UpdateSnapshot>('/update/status')); } catch { /* идёт перезапуск сервера */ }
+      try {
+        const next = await api<UpdateSnapshot>('/update/status');
+        // В фоновой вкладке можно пропустить состояние done: сравниваем сам процесс.
+        if (next.instanceId && update.instanceId && next.instanceId !== update.instanceId) {
+          location.reload(); return;
+        }
+        setUpdate(next);
+      } catch { /* идёт перезапуск сервера */ }
     }, 1000);
     return () => clearInterval(id);
   }, [update?.phase, update?.running]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (!update?.restartRequired) return;
     let stop = false;
+    const previousInstance = health?.instanceId;
+    let wentDown = false;
     const wait = async () => {
       for (let i = 0; i < 60 && !stop; i++) {
         await new Promise((r) => setTimeout(r, 1000));
-        try { const h = await api<Health>('/healthz', {}, 1500); if (h.ok) { location.reload(); return; } } catch { /* ждём */ }
+        try {
+          const h = await api<Health>('/healthz', {}, 1500);
+          if (!stop && h.ok && ((h.instanceId && h.instanceId !== previousInstance) || (!h.instanceId && wentDown))) {
+            location.reload(); return;
+          }
+        } catch { wentDown = true; }
       }
+      if (!stop) setUpdate((s) => s ? { ...s, phase: 'error', restartRequired: false,
+        message: 'Обновление установлено, но новый сервер не ответил. Проверьте журнал и запустите программу заново.' } : s);
     };
     wait();
     return () => { stop = true; };

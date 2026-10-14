@@ -35,6 +35,8 @@ export function run(cmd, args, { cwd, timeoutMs = 120_000, env = {} } = {}) {
     try {
       child = spawn(cmd, args, {
         cwd,
+        // Windows не запускает npm.cmd через CreateProcess без cmd.exe.
+        shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(cmd),
         env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...env },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -57,7 +59,7 @@ export function parseGithubRepo(url) {
   return m ? { owner: m[1], name: m[2] } : null;
 }
 
-export function createUpdater({ appDir, log = () => {} }) {
+export function createUpdater({ appDir, log = () => {}, onReady = () => {} }) {
   const cfg = readConfig(appDir);
   const repo = parseGithubRepo(cfg.repo);
 
@@ -129,10 +131,11 @@ export function createUpdater({ appDir, log = () => {} }) {
 
   /** Проверка новой версии. Не меняет файлы. */
   async function check() {
-    if (state.phase === 'running') return snapshot();
+    if (running || state.restartRequired) return snapshot();
     state.phase = 'checking';
     try {
       await detect();
+      if (running || state.restartRequired) return snapshot();
       if (!gitRoot) {
         setUnsupported('Программа установлена не из git-клона, поэтому автообновление недоступно. '
           + 'Переустановите её через install-windows.cmd или install-ubuntu.sh (см. README).');
@@ -141,6 +144,7 @@ export function createUpdater({ appDir, log = () => {} }) {
       const local = await localCommit();
       state.currentSha = local.sha;
       const remote = await remoteCommit();
+      if (running || state.restartRequired) return snapshot();
       state.checkedAt = Date.now();
       if (!remote) {
         state.phase = 'idle';
@@ -159,6 +163,7 @@ export function createUpdater({ appDir, log = () => {} }) {
         ? `Доступна новая версия (${remote.sha.slice(0, 7)}).`
         : 'Установлена актуальная версия.';
     } catch (e) {
+      if (running || state.restartRequired) return snapshot();
       state.phase = 'error';
       state.message = `Нет связи с GitHub: ${e.message || e}. Продолжаем работать на текущей версии.`;
     }
@@ -174,7 +179,7 @@ export function createUpdater({ appDir, log = () => {} }) {
 
   /** Установка обновления. Возвращает сразу; ход — в snapshot().steps. */
   function run_() {
-    if (running) return snapshot();
+    if (running || state.restartRequired) return snapshot();
     running = true;
     state.phase = 'running';
     state.restartRequired = false;
@@ -258,6 +263,7 @@ export function createUpdater({ appDir, log = () => {} }) {
       state.restartRequired = true;
       state.message = 'Обновление установлено. Программа перезапускается…';
       state.updateAvailable = false;
+      onReady(snapshot());
     } catch (e) {
       await fail(state.steps.find((s) => s.state === 'run')?.id || 'check', String(e.message || e));
     }

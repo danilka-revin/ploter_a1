@@ -1,7 +1,7 @@
-// UART-драйвер текстовых отчётов на основе AlexGyver/Printer:
+// UART-драйвер: plain (без команд), ESC/POS и AlexGyver/Printer:
 // https://github.com/AlexGyver/Printer/blob/f218472ce97d1789e15e9707345d5d9192245598/libraries/printer/printer.h
 // Перенос протокола в Node.js: Arduino/ESP и сторонняя прошивка не нужны.
-// begin(): FF, пауза 60 мс, ESC @; config(): ESC 7; font(): ESC !.
+// Только профиль alexgyver: begin(): FF, пауза 60 мс, ESC @; config(): ESC 7; font(): ESC !.
 // Нагрев 10/140/4 взят из WemosPrint. Выравнивание — пробелами,
 // подача — CR LF (Arduino Print.println), без команд ножа/штрих-кода.
 // Текст — ASCII: кириллица транслитом, управляющие байты удаляются.
@@ -221,18 +221,21 @@ function sleep(ms) { return ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Pro
 
 export class ReceiptPrinter {
   /**
-   * @param {{path:string, baudRate?:number, width?:number, cmdDelayMs?:number}} opts
+   * @param {{path:string, baudRate?:number, width?:number, cmdDelayMs?:number, profile?:string, lineDelayMs?:number}} opts
    *   path       — последовательный порт принтера (напр. /dev/ttyUSB1, COM4)
    *   baudRate   — скорость UART, по умолчанию 9600
    *   width      — ширина строки в символах (по умолчанию 32 для 58 мм бумаги)
    *   cmdDelayMs — пауза после каждой посылки (медленным принтерам), по умолчанию 20 мс
    */
-  constructor({ path, baudRate = DEFAULT_BAUD, width = DEFAULT_WIDTH, cmdDelayMs = CMD_DELAY_MS } = {}) {
+  constructor({ path, baudRate = DEFAULT_BAUD, width = DEFAULT_WIDTH, cmdDelayMs = CMD_DELAY_MS, profile = 'alexgyver', lineDelayMs = 0 } = {}) {
     this.path = path;
     this.baudRate = Number(baudRate) || DEFAULT_BAUD;
     this.width = clampWidth(width);
     this.cmdDelayMs = Math.max(0, Number(cmdDelayMs) || 0);
+    this.profile = PRINTER_PROFILES.includes(profile) ? profile : 'plain';
+    this.lineDelayMs = Math.max(0, Number(lineDelayMs) || 0);
     this.port = null;
+    this._portError = null;
     this._busy = null;
     this._style = { align: 0, bold: false, size: 0 };
   }
@@ -253,8 +256,10 @@ export class ReceiptPrinter {
         xoff: false,
         autoOpen: false,
       });
+      port.on('error', (err) => { this._portError = err; });
       port.open((err) => {
         if (err) { reject(new Error(`не удалось открыть принтер ${this.path} @ ${this.baudRate}: ${err.message}`)); return; }
+        this._portError = null;
         this.port = port;
         resolve();
       });
@@ -273,6 +278,7 @@ export class ReceiptPrinter {
 
   /** Отправить буфер с ожиданием, чтобы принтер успел принять. */
   async send(buf) {
+    if (this._portError) throw this._portError;
     if (!this.isOpen) throw new Error('Принтер не подключён.');
     await new Promise((resolve, reject) => {
       this.port.write(buf, (e) => {
@@ -286,11 +292,15 @@ export class ReceiptPrinter {
   // ---------- примитивы ----------
 
   async init() {
-    await this.send(CMD_WAKE);
-    await sleep(60); // Printer.wake(): пауза не зависит от cmdDelayMs
+    this._style = { align: 0, bold: false, size: 0 };
+    if (this.profile === 'plain') return;
+    if (this.profile === 'alexgyver') {
+      await this.send(CMD_WAKE);
+      await sleep(60);
+    }
     await this.send(CMD_INIT);
     this._style = { align: 0, bold: false, size: 0 };
-    await this.send(CMD_CONFIG);
+    if (this.profile === 'alexgyver') await this.send(CMD_CONFIG);
     await this.send(CMD_CODEPAGE_PC437);
   }
 
@@ -301,7 +311,7 @@ export class ReceiptPrinter {
   async font(size = 0, bold = this._style.bold) {
     const mode = sizeCode(size) | (bold ? FONT_EMPH : 0);
     const prev = sizeCode(this._style.size) | (this._style.bold ? FONT_EMPH : 0);
-    if (mode !== prev) await this.send(CMD_FONT(mode));
+    if (this.profile !== 'plain' && mode !== prev) await this.send(CMD_FONT(mode));
     this._style.size = size;
     this._style.bold = bold;
   }
@@ -310,6 +320,8 @@ export class ReceiptPrinter {
   async writeLine(text) {
     const line = alignedText(toPrinterText(text), this._style.align, this._style.size, this.width);
     await this.send(Buffer.concat([asciiBytes(line), CRLF]));
+    // drain() ждёт UART, а не механизм печати. Без DTR выдерживаем паузу.
+    await sleep(this.lineDelayMs * (this._style.size === 'big' || this._style.size === 'tall' ? 2 : 1));
   }
 
   async divider(ch = '-') {
@@ -323,7 +335,7 @@ export class ReceiptPrinter {
 
   async feed(n) {
     const count = Math.max(0, Math.min(255, Math.floor(Number(n) || 0)));
-    for (let i = 0; i < count; i++) await this.send(CRLF);
+    for (let i = 0; i < count; i++) { await this.send(CRLF); await sleep(this.lineDelayMs); }
   }
 
   /**
@@ -331,7 +343,7 @@ export class ReceiptPrinter {
    * если чек сам не закончился командой feed/cut.
    */
   async printLines(lines) {
-    const ops = layoutReceipt(lines, this.width);
+    const ops = layoutReceipt(this.profile === 'plain' ? plainReceipt(lines) : lines, this.width);
     const run = async () => {
       if (!this.isOpen) await this.open();
       await this.init();
@@ -371,4 +383,10 @@ export function isPrinterLikePort(p) {
   const text = `${p.path} ${p.manufacturer || ''} ${p.vendorId || ''} ${p.productId || ''} ${p.label || ''}`.toLowerCase();
   // любые USB-UART можно использовать, это просто подсказка — нет строгого фильтра
   return /ttyusb|ttyacm|cu\./i.test(text);
+}
+
+export const PRINTER_PROFILES = ['plain', 'escpos', 'alexgyver'];
+
+export function plainReceipt(lines) {
+  return (lines ?? []).map((ln) => ln?.t === 'text' ? { ...ln, size: 0, bold: false } : ln);
 }

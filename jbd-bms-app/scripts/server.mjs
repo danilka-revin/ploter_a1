@@ -36,7 +36,7 @@
 //   POST /api/printer/test                — пробная страница
 //   POST /api/printer/print {id}          — печать сводки по банку (id=all — по парку)
 //   GET  /api/printer/preview?id=         — тот же чек текстом, без печати (id=all — парк, id=test — пробная)
-//   Чеки печатаются на английском и только ASCII — так их понимает любой принтер.
+//   Чеки на английском, ASCII; скорость и профиль должны соответствовать модели.
 //
 // Старые одиночные адреса сохранены: /api/connect, /api/disconnect, /api/state,
 // /api/snapshot, /api/settings, /api/settings/write, /api/control/*, /api/backup*,
@@ -44,6 +44,8 @@
 //
 // Код выхода 10 означает «перезапустите меня» (его обрабатывает run.sh).
 
+import { randomUUID } from 'node:crypto';
+import { supervise } from './start.mjs';
 import { createServer } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
 import { extname, join, normalize, resolve, dirname, basename } from 'node:path';
@@ -68,6 +70,7 @@ const DIST = join(APP_DIR, 'dist');
 const MAX_BODY = 1024 * 1024;
 
 const pkg = JSON.parse(readFileSync(join(APP_DIR, 'package.json'), 'utf8'));
+const instanceId = randomUUID();
 export const VERSION = { app: pkg.version, commit: gitShortSha() };
 
 function gitShortSha() {
@@ -91,6 +94,8 @@ banks.start();
 // Порт принтера не должен опрашиваться как BMS: кадр опроса (dd a5 03 00 ff fd 77)
 // принтер напечатает иероглифами. isPortBusy не даёт печатать в порт, занятый платой.
 export const printer = new PrinterService({
+  // HTTP-тесты не должны менять настройки установленной программы.
+  configFile: process.env.BMS_PRINTER_CONFIG || (process.env.NODE_TEST_CONTEXT ? null : join(APP_DIR, 'printer.json')),
   log: (m) => console.log('принтер: ' + m),
   isPortBusy: (path) => Boolean(path) && banks.list().some((b) => b.path === path),
 });
@@ -205,7 +210,7 @@ async function handleApi(req, res, url) {
   const q = url.searchParams;
   const method = req.method;
 
-  if (method === 'GET' && pathname === '/healthz') return send(res, 200, { ok: true, ...VERSION });
+  if (method === 'GET' && pathname === '/healthz') return send(res, 200, { ok: true, ...VERSION, instanceId });
 
   // ----- каталог и списки -----
   if (method === 'GET' && pathname === '/api/catalog') {
@@ -423,6 +428,7 @@ async function handleApi(req, res, url) {
   }
   if (method === 'POST' && pathname === '/api/printer/config') {
     const body = await readJson(req);
+    if (printer.printing) throw httpError(409, 'PRINTER_BUSY', 'Дождитесь окончания печати.');
     // Порт отдали принтеру — если на нём висел банк, отключаем его: иначе опрос
     // платы (dd a5 03 …) продолжит печататься на принтере поверх чека.
     let freedPort = '';
@@ -437,6 +443,9 @@ async function handleApi(req, res, url) {
       }
     }
     return send(res, 200, { ...printer.configure(body), freedPort });
+  }
+  if (method === 'POST' && pathname === '/api/printer/diagnostic') {
+    return send(res, 200, await printer.diagnostic());
   }
   if (method === 'POST' && pathname === '/api/printer/test') {
     return send(res, 200, await printer.testPage());
@@ -488,12 +497,12 @@ async function handleApi(req, res, url) {
   }
 
   // ----- обновления -----
-  if (method === 'GET' && pathname === '/update/check') return send(res, 200, await updater.check());
-  if (method === 'POST' && pathname === '/update/run') return send(res, 202, updater.run());
+  if (method === 'GET' && pathname === '/update/check') return send(res, 200, { ...await updater.check(), instanceId });
+  if (method === 'POST' && pathname === '/update/run') return send(res, 202, { ...updater.run(), instanceId });
   if (method === 'GET' && pathname === '/update/status') {
     const snap = updater.snapshot();
     if (snap.restartRequired) scheduleRestart();
-    return send(res, 200, snap);
+    return send(res, 200, { ...snap, instanceId });
   }
   throw httpError(404, 'NOT_FOUND', 'Нет такого адреса.');
 }
@@ -507,15 +516,17 @@ function connectHint(path, message) {
   return `Плата не отвечает: ${message}. Проверьте провода (TX/RX/GND), уровень 3.3 В и выбран ли нужный порт. Если не знаете порт — «Найти и подключить все».`;
 }
 
-const updater = createUpdater({ appDir: APP_DIR, log: (m) => console.log('автообновление: ' + m) });
+const updater = createUpdater({ appDir: APP_DIR, log: (m) => console.log('автообновление: ' + m), onReady: scheduleRestart });
 
 let restartScheduled = false;
 function scheduleRestart() {
   if (restartScheduled) return;
   restartScheduled = true;
   setTimeout(async () => {
-    await banks.removeAll();
-    process.exit(RESTART_EXIT_CODE);
+    // Закрываем UART до запуска нового процесса; зависший драйвер не блокирует перезапуск.
+    const watchdog = setTimeout(() => process.exit(RESTART_EXIT_CODE), 5000);
+    try { await banks.removeAll(); await printer.close(); }
+    finally { clearTimeout(watchdog); process.exit(RESTART_EXIT_CODE); }
   }, 1500);
 }
 
@@ -591,6 +602,10 @@ if (isMain && process.argv.includes('--update-now')) {
   process.exit(await updateNow());
 }
 
+if (isMain && process.env.BMS_APP_SUPERVISED !== '1') {
+  process.exit(await supervise(process.argv.slice(2)));
+}
+
 if (isMain) {
   const host = process.env.BMS_APP_HOST || '127.0.0.1';
   const port = Number(process.argv[2] || process.env.BMS_APP_PORT || 8585);
@@ -623,6 +638,7 @@ if (isMain) {
   const shutdown = async () => {
     banks.stop();
     await banks.removeAll();
+    await printer.close();
     server.close();
     process.exit(0);
   };

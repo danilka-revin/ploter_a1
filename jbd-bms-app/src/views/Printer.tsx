@@ -1,7 +1,7 @@
 // Плитка «Чековый принтер»: выбор UART-порта TTL-принтера, скорости,
 // кнопка «тестовая страница», предпросмотр чека и главная кнопка «Распечатать сводку».
-// Сам чек печатается на английском языке и только символами ASCII — так его
-// правильно печатает любой ESC/POS-принтер (без иероглифов и «кракозябр»).
+// Чек на английском, только печатные ASCII-символы.
+// Кодировка не исправляет несовпадение скорости UART или протокола.
 import { useEffect, useState } from 'react';
 import { api } from '../api';
 import { Btn, Chip } from './Tile';
@@ -23,6 +23,8 @@ export function PrinterTile({
   const [path, setPath] = useState('');
   const [baudRate, setBaudRate] = useState(9600);
   const [width, setWidth] = useState(32);
+  const [pending, setPending] = useState(false);
+  const locked = busy != null || pending;
   const [allBanks, setAllBanks] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [preview, setPreview] = useState<PrinterPreview | null>(null);
@@ -58,18 +60,22 @@ export function PrinterTile({
   }, [allBanks, focus]); // eslint-disable-line
 
   const applyCfg = async (patch: Record<string, unknown>) => {
-    const s = await onConfig(patch);
-    if (s) { setStatus(s); setPath(s.path); setBaudRate(s.baudRate); setWidth(s.width); }
-    if (s && preview) loadPreview(preview.kind === 'test' ? 'test' : undefined);
+    setPending(true);
+    try {
+      const s = await onConfig(patch);
+      if (s) { setStatus(s); setPath(s.path); setBaudRate(s.baudRate); setWidth(s.width); }
+      if (s && preview) loadPreview(preview.kind === 'test' ? 'test' : undefined);
+    } finally { setPending(false); }
   };
 
-  const onPathBlur = () => {
-    if (path === (status?.path ?? '')) return;
-    applyCfg({ path });
-  };
-  const onBaudBlur = () => {
-    if (baudRate === (status?.baudRate ?? 9600)) return;
-    applyCfg({ baudRate });
+  const diagnostic = async () => {
+    setPending(true);
+    try {
+      await api('/api/printer/diagnostic', { method: 'POST' }, 15_000);
+      note('info', 'Тест отправлен. На бумаге должно быть Hello 123 ABC abc. Нечитаемо — сверьте скорость по самотесту принтера.');
+      await refresh();
+    } catch (e: any) { note('err', e.message); }
+    finally { setPending(false); }
   };
 
   const doTest = async () => {
@@ -99,7 +105,7 @@ export function PrinterTile({
           <i className="dot" style={{ background: portBusy ? 'var(--danger)' : (!status?.configured ? 'var(--warn)' : (status?.open ? 'var(--ok)' : 'var(--text-2)')) }} />
           принтер: {stateText}
         </span>
-        <span className="muted tiny" title="Чек печатается на английском только символами ASCII — их понимает любой принтер">чек на английском</span>
+        <span className="muted tiny" title="Для читаемого чека должны совпадать скорость UART и протокол принтера">чек на английском</span>
         <button type="button" className="linkish small" onClick={() => setExpanded((v) => !v)}>
           {expanded ? 'свернуть ▴' : 'настроить ▾'}
         </button>
@@ -117,9 +123,8 @@ export function PrinterTile({
       <div className="printer-main">
         <select
           value={path}
-          onChange={(e) => setPath(e.target.value)}
-          onBlur={onPathBlur}
-          disabled={busy != null && !busy.startsWith('printer')}
+          onChange={(e) => applyCfg({ path: e.target.value })}
+          disabled={locked}
           title="UART-порт TTL-принтера (5–9 В питание, RX/TX/GND)"
         >
           <option value="">— выберите порт принтера —</option>
@@ -134,7 +139,7 @@ export function PrinterTile({
           type="button"
           className="b primary print-btn"
           onClick={doPrint}
-          disabled={!configured || busy != null || !banks.length}
+          disabled={!configured || locked || !banks.length}
           title={`Распечатать чек (на английском) со сводкой по ${allBanks ? 'всему парку' : (selectedBank?.label ?? 'аккумулятору')}`}
         >
           🖶 {busy === 'printer' ? 'Печать…' : `Печать сводки${allBanks ? ' (все)' : ''}`}
@@ -177,8 +182,24 @@ export function PrinterTile({
         <div className="printer-cfg">
           <div className="printer-row">
             <label className="printer-field">
+              <span>протокол</span>
+              <select value={status?.profile ?? 'plain'} onChange={(e) => applyCfg({ profile: e.target.value })} disabled={locked}>
+                <option value="plain">Простой текст (без команд)</option>
+                <option value="escpos">ESC/POS (без команд нагрева)</option>
+                <option value="alexgyver">AlexGyver / TTL (команды нагрева)</option>
+              </select>
+            </label>
+            <label className="printer-field">
+              <span>пауза после строки</span>
+              <select value={status?.lineDelayMs ?? 800} onChange={(e) => applyCfg({ lineDelayMs: Number(e.target.value) })} disabled={locked}>
+                {[0, 100, 300, 800, 1500, 2000].map((ms) => <option key={ms} value={ms}>{ms} мс</option>)}
+              </select>
+            </label>
+          </div>
+          <div className="printer-row">
+            <label className="printer-field">
               <span>скорость UART</span>
-              <select value={baudRate} onChange={(e) => setBaudRate(Number(e.target.value))} onBlur={onBaudBlur} disabled={busy != null}>
+              <select value={baudRate} onChange={(e) => applyCfg({ baudRate: Number(e.target.value) })} disabled={locked}>
                 {(status?.bauds ?? [9600, 19200, 38400, 57600, 115200]).map((b) => (
                   <option key={b} value={b}>{b} бод</option>
                 ))}
@@ -186,13 +207,16 @@ export function PrinterTile({
             </label>
             <label className="printer-field">
               <span>ширина</span>
-              <select value={width} onChange={(e) => applyCfg({ width: Number(e.target.value) })} disabled={busy != null}>
+              <select value={width} onChange={(e) => applyCfg({ width: Number(e.target.value) })} disabled={locked}>
                 {[24, 32, 36, 42, 48].map((w) => <option key={w} value={w}>{w} симв.</option>)}
               </select>
             </label>
           </div>
           <div className="printer-row">
-            <Btn small onClick={doTest} disabled={!configured || busy != null} title="Напечатать пробную страницу для проверки подключения">
+            <Btn small onClick={diagnostic} disabled={!configured || locked} title="Короткий ASCII-тест без ESC-команд на выбранной скорости">
+              Тест Hello 123 (без команд)
+            </Btn>
+            <Btn small onClick={doTest} disabled={!configured || locked} title="Напечатать пробную страницу для проверки подключения">
               {busy === 'printer-test' ? 'Печать…' : 'Пробная страница'}
             </Btn>
             <button type="button" className="linkish small" onClick={() => loadPreview('test')} title="Показать пробную страницу на экране">как она выглядит</button>
@@ -200,17 +224,17 @@ export function PrinterTile({
           </div>
           {status?.lastError && <div className="banner err small">{status.lastError}</div>}
           <p className="muted tiny">
-            Чек печатается на английском языке только латиницей и цифрами (ASCII): такие символы одинаково
-            печатает любой чековый принтер, кодовую страницу и кириллицу настраивать не нужно.
-            Если на бумаге всё равно непонятные символы — даже вместо цифр, — не совпадает скорость:
-            попробуйте 19200 или 115200 (скорость своей модели видно на самотесте — включите принтер
-            с зажатой кнопкой FEED). Строки переносятся не там — подберите ширину по линейке на пробной странице.
-            Порт принтера программа не опрашивает как плату и не подключает его кнопкой «Найти и подключить все»:
-            иначе кадры опроса BMS (dd a5 03 00 ff fd 77) печатались бы иероглифами.
+            Начните с «Простой текст» и «Тест Hello 123». Этот тест не отправляет команды шрифта,
+            нагрева или кодировки. Если даже цифры нечитаемы, сверьте UART baud и 8N1 с самотестом
+            принтера (обычно включение с зажатой кнопкой FEED; смотрите инструкцию модели).
+            Выбирайте скорости по одной, после каждого теста проверяйте бумагу. Без обратной связи
+            нельзя автоматически определить читаемость. Если тест читаемый, но длинный чек повреждается,
+            увеличьте паузу до 800–2000 мс и проверьте питание. Затем можно попробовать ESC/POS;
+            AlexGyver выбирайте только для совместимого TTL-принтера. Порт принтера исключён из опроса BMS.
           </p>
           <p className="muted tiny">
             Подключение: GND принтера к GND адаптера, TX принтера к RX адаптера, RX принтера к TX адаптера.
-            Уровень логики у большинства дешёвых TTL-принтеров — 5 В. Принтер подключается на отдельный
+            Уровень логики и питание сверяйте с паспортом модели: TTL и RS-232 электрически несовместимы. Принтер подключается на отдельный
             USB-UART адаптер параллельно BMS.
           </p>
         </div>

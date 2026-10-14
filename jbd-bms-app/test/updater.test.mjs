@@ -76,11 +76,16 @@ test('новый коммит в origin устанавливается: fetch �
   git(other, 'push', 'origin', 'main');
   const latest = git(other, 'rev-parse', 'HEAD');
 
-  const updater = createUpdater({ appDir });
+  let readyCount = 0;
+  const updater = createUpdater({ appDir, onReady: () => { readyCount++; } });
   updater.run();
   const s = await waitDone(updater);
   assert.equal(s.phase, 'done', s.message);
   assert.equal(s.restartRequired, true);
+  assert.equal(readyCount, 1, 'сервер уведомлён без запроса /update/status');
+  assert.equal((await updater.check()).restartRequired, true, 'проверка не сбрасывает ожидание перезапуска');
+  updater.run();
+  assert.equal(readyCount, 1, 'повторное нажатие не запускает обновление заново');
   assert.equal(git(work, 'rev-parse', 'HEAD'), latest);
   assert.ok(readFileSync(join(appDir, 'NEW.txt'), 'utf8').includes('новая версия'));
   // lock-хэш записан: повторное обновление без изменений не переустанавливает библиотеки

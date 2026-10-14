@@ -197,7 +197,7 @@ test('чековый принтер: предпросмотр чека на ан
   assert.equal(fleet.data.kind, 'fleet');
   assert.ok(ascii(fleet.data.lines, fleet.data.width), fleet.data.lines.join('\n'));
   const fleetText = fleet.data.lines.join('\n');
-  assert.match(fleetText, /A L L {3}B A T T E R I E S/);
+  assert.match(fleetText, /ALL BATTERIES/);
   assert.match(fleetText, /DEMO A - online/, 'подпись «ДЕМО A» напечатается латиницей');
   assert.doesNotMatch(fleetText, /[А-Яа-яЁё]/);
 
