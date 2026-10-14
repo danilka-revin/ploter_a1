@@ -1,5 +1,5 @@
-// Чековый принтер: чек на английском и только ASCII — без кириллицы, CP866 и
-// «странных символов», строки не шире бумаги, в порт уходят только байты < 0x80.
+// Чековый принтер: текст на английском в ASCII, строки не шире бумаги.
+// Старшие байты только служебные: wake FF и нагрев 140.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
@@ -134,18 +134,24 @@ const count = (buf, seq) => {
   return n;
 };
 
-test('в порт принтера уходят только байты < 0x80: ESC/POS-команды и английский текст', async () => {
+test('UART-протокол AlexGyver: wake, init, нагрев, таблица, шрифт и ASCII-отчёт', async () => {
   const p = new ReceiptPrinter({ path: 'capture', width: 32, cmdDelayMs: 0 });
   p.port = new CapturePort();
   await p.printLines(buildBankReceipt(bank, fleet, 32));
   const bytes = p.port.bytes;
   const high = [...bytes].filter((b) => b >= 0x80);
-  assert.deepEqual(high, [], 'ни одного байта ≥ 0x80 — нечему превратиться в иероглифы или «кракозябры»');
-  assert.deepEqual([...bytes.subarray(0, 2)], [0x1b, 0x40], 'начало — ESC @ (сброс принтера)');
-  assert.equal(count(bytes, Buffer.from([0x1b, 0x52, 0x00])), 1, 'ESC R 0 — набор символов США');
-  assert.equal(count(bytes, Buffer.from([0x1b, 0x74, 0x00])), 1, 'ESC t 0 — PC437');
-  assert.equal(count(bytes, Buffer.from([0x1b, 0x74, 17])), 0, 'кодовая страница CP866 больше не включается');
-  assert.equal(count(bytes, Buffer.from([0x1d, 0x56, 0x42, 0x00])), 1, 'один отрез в конце, без лишней ленты');
+  assert.deepEqual(high, [0xff, 140], 'wake FF и время нагрева 140, весь текст — ASCII');
+  assert.deepEqual([...bytes.subarray(0, 11)], [
+    0xff, 0x1b, 0x40, 0x1b, 0x37, 10, 140, 4, 0x1b, 0x74, 0,
+  ], 'Printer.begin(), WemosPrint.config(10,140,4), setCharTable(0)');
+  assert.equal(count(bytes, Buffer.from([0x1b, 0x21, 0x38])), 1, 'ESC !: жирный + двойная высота/ширина');
+  for (const seq of [[0x1b, 0x61], [0x1b, 0x45], [0x1b, 0x64], [0x1d, 0x21], [0x1d, 0x56]]) {
+    assert.equal(count(bytes, Buffer.from(seq)), 0, 'нет команды вне текстового API AlexGyver');
+  }
+  assert.ok(bytes.subarray(-8).equals(Buffer.from('\r\n'.repeat(4))), 'четыре строки подачи без ножа');
+  for (let i = 0; i < bytes.length; i++) {
+    if (bytes[i] === 10 && bytes[i - 1] !== 0x37) assert.equal(bytes[i - 1], 13, 'println использует CR LF');
+  }
   const text = bytes.toString('latin1');
   for (const s of ['BATTERY REPORT', 'Bank Garazh', 'Voltage', '39.71 V', '! Cell overvoltage', 'Printed by JBD BMS']) {
     assert.ok(text.includes(s), `в потоке есть «${s}»`);
@@ -165,8 +171,8 @@ test('сервис: настройка ширины применяется к у
   const r = await svc.testPage();
   assert.equal(r.ok, true);
   const text = p.port.bytes.toString('latin1');
-  assert.ok(text.includes('123456789012345678901234567890123456789012\n'), 'линейка в новую ширину 42');
-  assert.ok([...p.port.bytes].every((b) => b < 0x80));
+  assert.ok(text.includes('123456789012345678901234567890123456789012\r\n'), 'линейка в новую ширину 42');
+  assert.ok([...p.port.bytes.subarray(11)].every((b) => b < 0x80));
 
   const prev = svc.previewBank(bank, fleet);
   assert.equal(prev.kind, 'bank');
@@ -177,7 +183,7 @@ test('сервис: настройка ширины применяется к у
   await svc.close();
 });
 
-test('настоящий последовательный порт (socat): принтер получает английский чек только в ASCII', async (t) => {
+test('настоящий последовательный порт (socat): протокол AlexGyver и ASCII-текст', async (t) => {
   if (spawnSync('which', ['socat']).status !== 0) { t.skip('socat не установлен'); return; }
   const dir = mkdtempSync(join(tmpdir(), 'jbd-printer-'));
   const printerEnd = join(dir, 'printer');
@@ -204,7 +210,7 @@ test('настоящий последовательный порт (socat): пр
 
     const bytes = Buffer.concat(got);
     assert.ok(bytes.length > 500, `принтер получил ${bytes.length} байт`);
-    assert.deepEqual([...bytes].filter((b) => b >= 0x80), [], 'ни одного байта ≥ 0x80');
+    assert.deepEqual([...bytes].filter((b) => b >= 0x80), [0xff, 140], 'старшие байты только в wake/config');
     const text = bytes.toString('latin1');
     for (const s of ['ALL BATTERIES', 'Summary report', 'Bank Garazh - online', 'DEMO B - OFFLINE', '! Cell overvoltage']) {
       assert.ok(text.includes(s), `принтер получил «${s}»`);
@@ -214,4 +220,63 @@ test('настоящий последовательный порт (socat): пр
     socat.kill('SIGTERM');
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('ESC !: режимы шрифта, выравнивание пробелами и возврат к обычному тексту', async () => {
+  const p = new ReceiptPrinter({ width: 32, cmdDelayMs: 0 });
+  p.port = new CapturePort();
+  const lines = [
+    { t: 'text', text: 'BIG', size: 'big', bold: true, align: 1 },
+    { t: 'text', text: 'WIDE', size: 'wide', align: 2 },
+    { t: 'text', text: 'TALL', size: 'tall', bold: true },
+    { t: 'text', text: 'normal', align: 1 },
+    { t: 'feed', n: 2 },
+  ];
+  await p.printLines(lines);
+  const text = p.port.bytes.toString('latin1');
+  for (const mode of [0x38, 0x20, 0x18, 0]) {
+    assert.equal(count(p.port.bytes, Buffer.from([0x1b, 0x21, mode])), 1);
+  }
+  assert.ok(text.includes('      BIG\r\n'));
+  assert.ok(text.includes('            WIDE\r\n'));
+  assert.ok(text.includes('TALL\r\n'));
+  assert.ok(text.includes('             normal\r\n'));
+  assert.equal(text.endsWith('normal\r\n\r\n\r\n'), true, 'нет лишней подачи');
+  assert.equal(renderReceiptText(lines, 32)[0], '            B I G');
+});
+
+test('старый cut и barcode не отправляют неподдерживаемые команды', async () => {
+  const p = new ReceiptPrinter({ cmdDelayMs: 0 });
+  p.port = new CapturePort();
+  await p.printLines([{ t: 'barcode', text: '123' }, { t: 'cut' }]);
+  assert.ok(p.port.bytes.toString('latin1').includes('[barcode 123]\r\n'));
+  assert.equal(count(p.port.bytes, Buffer.from([0x1d, 0x6b])), 0);
+  assert.equal(count(p.port.bytes, Buffer.from([0x1d, 0x56])), 0);
+  assert.ok(p.port.bytes.subarray(-8).equals(Buffer.from('\r\n'.repeat(4))));
+});
+
+test('ошибка подачи не скрывается, очередь восстанавливается после ошибки', async () => {
+  const p = new ReceiptPrinter({ cmdDelayMs: 0 });
+  p.port = new CapturePort();
+  const write = p.port.write.bind(p.port);
+  let fail = true;
+  p.port.write = (buf, cb) => {
+    if (fail && buf.equals(Buffer.from('\r\n'))) {
+      fail = false;
+      cb(new Error('UART failed'));
+    } else write(buf, cb);
+  };
+  await assert.rejects(p.printLines(['first']), /UART failed/);
+  await p.printLines(['second']);
+  assert.ok(p.port.bytes.toString('latin1').includes('second\r\n'));
+});
+
+test('параллельные отчёты передаются целиком, не перемешиваясь', async () => {
+  const p = new ReceiptPrinter({ cmdDelayMs: 0 });
+  p.port = new CapturePort();
+  await Promise.all([p.printLines(['FIRST']), p.printLines(['SECOND'])]);
+  const text = p.port.bytes.toString('latin1');
+  assert.equal([...p.port.bytes].filter((b) => b === 0xff).length, 2);
+  assert.ok(text.indexOf('FIRST') < text.lastIndexOf('\xff'));
+  assert.ok(text.lastIndexOf('\xff') < text.indexOf('SECOND'));
 });

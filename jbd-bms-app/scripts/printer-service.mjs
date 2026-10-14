@@ -1,5 +1,5 @@
 // Сервис управления UART-чековым принтером: конфигурация, подключение,
-// форматирование сводки по аккумулятору и печать на ESC/POS-принтер
+// форматирование сводки и печать по протоколу AlexGyver/Printer
 // (TTL UART, 5–9 В, типично 9600/19200 8N1).
 //
 // Чеки печатаются на АНГЛИЙСКОМ и только символами ASCII — так их правильно
@@ -282,7 +282,7 @@ function buildTestPage({ path, baudRate, width }) {
     { t: 'text', text: ruler },
     { t: 'blank', n: 1 },
     { t: 'text', text: fmtTime(Date.now()), align: 1 },
-    { t: 'cut' },
+    { t: 'feed', n: 4 },
   ];
 }
 
@@ -370,7 +370,7 @@ function buildBankReceipt(b, fleet, width = 32) {
 
   lines.push({ t: 'text', text: 'Printed by JBD BMS', align: 1 });
   lines.push({ t: 'text', text: fmtTime(Date.now()), align: 1 });
-  lines.push({ t: 'cut' });
+  lines.push({ t: 'feed', n: 4 });
   return lines;
 }
 
@@ -413,7 +413,7 @@ function buildFleetReceipt(rows, fleet, width = 32) {
   lines.push({ t: 'divider' });
   lines.push({ t: 'text', text: 'Printed by JBD BMS', align: 1 });
   lines.push({ t: 'text', text: fmtTime(Date.now()), align: 1 });
-  lines.push({ t: 'cut' });
+  lines.push({ t: 'feed', n: 4 });
   return lines;
 }
 
