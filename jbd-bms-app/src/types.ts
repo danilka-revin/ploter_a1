@@ -379,3 +379,25 @@ export interface Report {
 export interface PortsResponseExtended extends PortsResponse {
   ports: (PortItem & { used?: boolean })[];
 }
+
+export interface PrinterStatus {
+  configured: boolean;
+  path: string;
+  baudRate: number;
+  ascii: boolean;
+  charPage: number;
+  width: number;
+  open: boolean;
+  lastError: string;
+  lastPrintAt: number;
+  bauds: number[];
+}
+
+export interface PrintResult {
+  ok: boolean;
+  at: number;
+  path?: string;
+  baudRate?: number;
+  bank?: string;
+  banks?: number;
+}
