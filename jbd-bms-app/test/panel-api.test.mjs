@@ -184,3 +184,34 @@ test('резервная копия и восстановление: файл ч
   const after = await get(`/api/bank/settings?id=${id}`);
   assert.equal(after.data.items.find((i) => i.key === 'covp').value, 3640);
 });
+
+test('чековый принтер: предпросмотр чека на английском (ASCII), без порта печать не начинается', async () => {
+  const st = await get('/api/printer');
+  assert.equal(st.status, 200);
+  assert.equal(st.data.language, 'en');
+  assert.equal('charPage' in st.data, false, 'кодовой страницы больше нет — печатается только ASCII');
+
+  const ascii = (lines, width) => lines.every((l) => /^[\x20-\x7e]*$/.test(l) && l.length <= width);
+  const fleet = await get('/api/printer/preview?id=all');
+  assert.equal(fleet.status, 200, JSON.stringify(fleet.data));
+  assert.equal(fleet.data.kind, 'fleet');
+  assert.ok(ascii(fleet.data.lines, fleet.data.width), fleet.data.lines.join('\n'));
+  const fleetText = fleet.data.lines.join('\n');
+  assert.match(fleetText, /A L L {3}B A T T E R I E S/);
+  assert.match(fleetText, /DEMO A - online/, 'подпись «ДЕМО A» напечатается латиницей');
+  assert.doesNotMatch(fleetText, /[А-Яа-яЁё]/);
+
+  const id = (await get('/api/banks')).data.banks[0].id;
+  const one = await get(`/api/printer/preview?id=${id}`);
+  assert.equal(one.data.kind, 'bank');
+  assert.ok(ascii(one.data.lines, one.data.width));
+  assert.match(one.data.lines.join('\n'), /^Voltage +\d+\.\d\d V$/m);
+
+  const testPage = await get('/api/printer/preview?id=test');
+  assert.match(testPage.data.lines.join('\n'), /PRINTER TEST/);
+  assert.equal((await get('/api/printer/preview?id=nope')).status, 404);
+
+  const noPort = await post('/api/printer/print', { id });
+  assert.equal(noPort.status, 400);
+  assert.equal(noPort.data.error, 'NO_PRINTER');
+});

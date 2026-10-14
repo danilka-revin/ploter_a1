@@ -436,6 +436,14 @@ html[data-theme='light'] body { background: #e9ecf1; }
 .printer-field.inline { flex-direction: row; align-items: center; gap: 6px; color: var(--text-2); }
 .printer-field select { background: var(--surface-2); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; height: 24px; font-size: 11px; }
 .printer-field.inline input { accent-color: var(--accent); }
+/* предпросмотр чека: «бумажная лента» с моноширинным текстом ровно в ширину чека */
+.printer-preview { display: grid; gap: 4px; justify-items: start; min-width: 0; }
+.receipt {
+  margin: 0; max-width: 100%; max-height: 300px; overflow: auto; padding: 8px 9px; border-radius: 3px;
+  background: #fbfaf5; color: #1c1c1c; white-space: pre; tab-size: 4;
+  font: 11px/1.35 'SFMono-Regular', 'JetBrains Mono', ui-monospace, Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.07), 0 1px 3px rgba(0, 0, 0, 0.25);
+}
 .linkish.small { font-size: 11px; color: var(--accent-text); padding: 2px 6px; border-radius: 6px; }
 .linkish.small:hover { background: var(--accent-soft); }
 .banner.small { font-size: 11px; padding: 4px 7px; }

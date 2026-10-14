@@ -5,19 +5,25 @@
 // скорости 9600 8N1. У некоторых моделей скорость иная (19200 / 115200) —
 // она задаётся параметром baudRate.
 //
+// Чек печатается ТОЛЬКО 7-битным ASCII: английский текст, латиница, цифры.
+// Почему не кириллица: у таких принтеров по умолчанию часто включён китайский
+// шрифт (GB18030), и любой байт ≥ 0x80 (кириллица в CP866 и т. п.) печатается
+// иероглифами; номера кодовых страниц ESC t у разных производителей тоже не
+// совпадают. Символы 0x20–0x7E одинаково печатает любой ESC/POS-принтер.
+// Поэтому каждая строка проходит через toPrinterText(): кириллица — транслитом,
+// типографские знаки (° Δ · — « » № …) — ASCII-заменами, управляющие байты
+// вырезаются (чтобы строка из платы не стала командой принтера).
+//
 // Модуль умеет:
 //   • открыть/закрыть порт;
-//   • напечатать простой текст с выравниванием (влево/центр/вправо) и
-//     двойной/утолщённой шириной (для заголовков);
-//   • разделитель (пунктир);
-//   • простой штрих-код CODE128 (если модель поддерживает);
-//   • прогон бумаги и отрез (полный/неполный) или просто несколько
-//     пустых строк после печати, если отрез не поддерживается;
-//   • транслитерацию русского текста в CP866-совместимую раскладку —
-//     большинство TTL-принтеров содержат знакогенератор CP866 и выводят
-//     кириллицу, если включить кодовую страницу 17. Если же ваша модель
-//     не имеет кириллицы — установите {ascii: true}, и текст пойдёт
-//     транслитом.
+//   • напечатать текст с выравниванием (влево/центр/вправо), жирный и
+//     двойной размер (для заголовков);
+//   • строку «название … значение» во всю ширину (не влезает — значение
+//     переносится на следующую строку, прижатым вправо);
+//   • разделитель, пустые строки, штрих-код CODE128, прогон бумаги и отрез
+//     (если у модели нет ножа, команда отреза просто игнорируется);
+//   • показать чек обычным текстом (renderReceiptText) — для предпросмотра
+//     в интерфейсе и для тестов.
 //
 // Пример:
 //   import { ReceiptPrinter } from './printer.mjs';
@@ -29,6 +35,7 @@
 import { SerialPort } from 'serialport';
 
 const DEFAULT_BAUD = 9600;
+const DEFAULT_WIDTH = 32;
 /** Задержка между командами: дешёвые принтеры медленно переваривают ESC-команды. */
 const CMD_DELAY_MS = 20;
 /** Сколько пустых строк подать после печати (вместо отреза, если его нет). */
@@ -39,87 +46,211 @@ const ESC = 0x1b;
 const GS = 0x1d;
 const LF = 0x0a;
 
-// ESC @ — инициализация
+// ESC @ — инициализация (сброс выравнивания, шрифта, жирности)
 const CMD_INIT = Buffer.from([ESC, 0x40]);
+// ESC R 0 — международный набор «США»: стандартные # $ @ [ \ ] ^ { | } ~
+const CMD_INTL_USA = Buffer.from([ESC, 0x52, 0x00]);
+// ESC t 0 — кодовая страница PC437. Байты ≥ 0x80 мы не шлём вовсе, команда —
+// только для предсказуемого состояния принтера.
+const CMD_CODEPAGE_PC437 = Buffer.from([ESC, 0x74, 0x00]);
 // ESC a n — выравнивание: 0 влево, 1 центр, 2 вправо
 const CMD_ALIGN = (n) => Buffer.from([ESC, 0x61, n & 0x03]);
 // GS ! n — размер шрифта: 0x00 обычный, 0x10 двойная высота, 0x01 двойная ширина, 0x11 обе
 const CMD_SIZE = (n) => Buffer.from([GS, 0x21, n & 0xff]);
 // ESC E n — жирный: 0 выкл, 1 вкл
 const CMD_BOLD = (n) => Buffer.from([ESC, 0x45, n ? 1 : 0]);
-// ESC t n — выбор таблицы символов: 17 = CP866 (кириллица DOS), 2 = PC850 (латиница)
-const CMD_CHARSET = (n) => Buffer.from([ESC, 0x74, n & 0xff]);
-// GS V n — отрез (0x41 полный, 0x42 неполный, с подачей). Для принтеров без ножа
+// GS V 66 n — подача к ножу и неполный отрез. Для принтеров без ножа
 // это просто подача бумаги — команда безопасно игнорируется.
-const CMD_CUT_FULL = Buffer.from([GS, 0x56, 0x41, 0x00]);
 const CMD_CUT_PART = Buffer.from([GS, 0x56, 0x42, 0x00]);
 // ESC d n — подать n строк
 const feed = (n) => Buffer.from([ESC, 0x64, Math.max(0, Math.min(255, n))]);
-// GS k m d1...dk 0 — штрих-код CODE128 (m=73 для CODE128 в новых моделях).
-// Чтобы не усложнять — отправляем простой вариант CODE128 B с завершающим NUL.
 
-/**
- * @param {string} text
- */
+/** GS k 73 n {B data — штрих-код CODE128, набор B (печатный ASCII; «{» экранируется как «{{»). */
 function barcode128(text) {
-  const data = Buffer.from(text, 'ascii');
-  // CODE128 B: старт-символ 0x42, потом ASCII-символы + 32, потом контрольная сумма
-  const out = [GS, 0x6b, 0x49, data.length];
-  for (let i = 0; i < data.length; i++) out.push(data[i]);
-  return Buffer.from(out);
+  const data = Buffer.from(`{B${text.replace(/\{/g, '{{')}`, 'ascii');
+  return Buffer.concat([Buffer.from([GS, 0x6b, 0x49, data.length]), data]);
 }
 
-// ---------- транслит кириллицы (на случай если у принтера нет CP866) ----------
-const RU_TR = {
-  'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'yo','ж':'zh','з':'z','и':'i','й':'y',
-  'к':'k','л':'l','м':'m','н':'n','о':'o','п':'p','р':'r','с':'s','т':'t','у':'u','ф':'f',
-  'х':'kh','ц':'ts','ч':'ch','ш':'sh','щ':'sch','ъ':'\'','ы':'y','ь':'\'','э':'e','ю':'yu','я':'ya',
+// ---------- перевод любого текста в печатный ASCII ----------
+
+/** Транслит кириллицы (русский + украинские/белорусские буквы) латиницей. */
+const CYR = {
+  'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'yo', 'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y',
+  'к': 'k', 'л': 'l', 'м': 'm', 'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u', 'ф': 'f',
+  'х': 'kh', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'shch', 'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya',
+  'є': 'ye', 'і': 'i', 'ї': 'yi', 'ґ': 'g', 'ў': 'u',
 };
-function translitRu(s) {
-  return s.split('').map((ch) => {
+
+/** Типографские и технические знаки, которых нет в ASCII. */
+const SYMBOLS = {
+  '\u00a0': ' ', '\u2002': ' ', '\u2003': ' ', '\u2007': ' ', '\u2009': ' ', '\u200a': ' ', '\u202f': ' ',
+  '\u2010': '-', '\u2011': '-', '\u2012': '-', '\u2013': '-', '\u2014': '-', '\u2015': '-', '\u2212': '-',
+  '\u00b7': '-', '\u2022': '*', '\u2026': '...',
+  '\u00ab': '"', '\u00bb': '"', '\u201c': '"', '\u201d': '"', '\u201e': '"', '\u2018': "'", '\u2019': "'", '\u201a': "'",
+  '\u00b0': 'deg', '\u2103': 'C', '\u2116': 'No.', '\u00d7': 'x', '\u00f7': '/', '\u00b1': '+/-', '\u2248': '~',
+  '\u2264': '<=', '\u2265': '>=', '\u2260': '!=', '\u2192': '->', '\u2190': '<-', '\u2191': '^', '\u2193': 'v',
+  '\u00b5': 'u', '\u03bc': 'u', '\u0394': 'd', '\u03b4': 'd', '\u03a9': 'Ohm', '\u2126': 'Ohm',
+  '\u26a0': '!', '\u2713': 'v', '\u2714': 'v', '\u2717': 'x', '\u2718': 'x', '\u00a9': '(c)', '\u00ae': '(R)',
+  '\u20ac': 'EUR', '\u20bd': 'RUB', '\u00a3': 'GBP', '\u00df': 'ss', '\u00e6': 'ae', '\u00c6': 'AE',
+  '\u00f8': 'o', '\u00d8': 'O', '\u0142': 'l', '\u0141': 'L', '\u0111': 'd', '\u0110': 'D',
+};
+
+const isLetter = (c) => Boolean(c) && c.toLowerCase() !== c.toUpperCase();
+const isUpper = (c) => isLetter(c) && c === c.toUpperCase();
+
+/**
+ * Любая строка → только печатный ASCII (0x20–0x7E).
+ * Кириллица — транслитом («Банк 1» → «Bank 1», «ДЕМО» → «DEMO»), знаки
+ * вроде ° Δ · — № — ASCII-заменами, буквы с диакритикой — без неё,
+ * управляющие символы вырезаются, всё остальное — «?».
+ */
+export function toPrinterText(input) {
+  const chars = Array.from(String(input ?? '').normalize('NFC'));
+  let out = '';
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
+    const code = ch.codePointAt(0);
+    if (code >= 0x20 && code < 0x7f) { out += ch; continue; }
+    if (ch === '\t') { out += ' '; continue; }
+    if (code < 0x20 || (code >= 0x7f && code < 0xa0)) continue; // управляющие — выкидываем
     const lower = ch.toLowerCase();
-    const tr = RU_TR[lower];
-    if (!tr) return ch;
-    return ch === lower ? tr : tr[0].toUpperCase() + tr.slice(1);
-  }).join('');
+    const tr = CYR[lower];
+    if (tr !== undefined) {
+      if (ch === lower || !tr) { out += tr; continue; }
+      // «Щука» → «Shchuka», «ЩУКА» → «SHCHUKA»
+      const wholeWordUpper = isUpper(chars[i + 1]) || (!isLetter(chars[i + 1]) && isUpper(chars[i - 1]));
+      out += wholeWordUpper ? tr.toUpperCase() : tr[0].toUpperCase() + tr.slice(1);
+      continue;
+    }
+    if (SYMBOLS[ch] !== undefined) { out += SYMBOLS[ch]; continue; }
+    const base = ch.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    if (base && /^[\x20-\x7e]+$/.test(base)) { out += base; continue; }
+    out += '?';
+  }
+  return out;
+}
+
+/** Строка → байты для принтера (гарантированно < 0x80). */
+function asciiBytes(text) {
+  return Buffer.from(toPrinterText(text), 'ascii');
+}
+
+// ---------- раскладка чека по строкам ----------
+
+const clampWidth = (w) => {
+  const n = Math.round(Number(w));
+  return Number.isFinite(n) && n >= 16 ? Math.min(n, 64) : DEFAULT_WIDTH;
+};
+const isDoubleWidth = (size) => size === 'big' || size === 'wide';
+const sizeCode = (size) => (size === 'big' ? 0x11 : size === 'wide' ? 0x01 : size === 'tall' ? 0x10 : 0x00);
+const alignCode = (a) => (a === 1 || a === 2 ? a : 0);
+
+/** Перенос строки по ширине: по пробелам, слишком длинные слова — жёстко. */
+function splitLines(text, width) {
+  const out = [];
+  for (const raw of String(text).split(/\r?\n/)) {
+    if (raw.length <= width) { out.push(raw); continue; }
+    let cur = '';
+    for (const word of raw.split(/(\s+)/)) {
+      if (!word) continue;
+      if ((cur + word).length > width && cur.trim()) { out.push(cur.trimEnd()); cur = word.trimStart(); }
+      else cur += word;
+      while (cur.length > width) { out.push(cur.slice(0, width)); cur = cur.slice(width); }
+    }
+    if (cur.trim() || !out.length) out.push(cur.trimEnd());
+  }
+  return out.length ? out : [''];
+}
+
+const lineOp = (text, { align = 0, bold = false, size = 0 } = {}) => ({ op: 'line', text, align, bold, size });
+
+/**
+ * Раскладка чека: команды верхнего уровня
+ *   { t: 'text', text, align?, bold?, size? }  — абзац (size: 'big' | 'wide' | 'tall')
+ *   { t: 'row', left, right, bold? }           — «название … значение» во всю ширину
+ *   { t: 'divider', ch? } · { t: 'blank', n? } · { t: 'feed', n } · { t: 'barcode', text } · { t: 'cut' }
+ * превращаются в плоский список операций печати. Каждая строка — уже ASCII
+ * и не длиннее ширины бумаги (для двойной ширины — половины).
+ */
+export function layoutReceipt(lines, width = DEFAULT_WIDTH) {
+  const w = clampWidth(width);
+  const ops = [];
+  for (const ln of lines ?? []) {
+    if (typeof ln === 'string') {
+      for (const part of splitLines(toPrinterText(ln), w)) ops.push(lineOp(part));
+      continue;
+    }
+    switch (ln?.t) {
+      case 'text': {
+        const size = ln.size || 0;
+        const align = alignCode(ln.align);
+        const cols = isDoubleWidth(size) ? Math.max(1, Math.floor(w / 2)) : w;
+        for (const part of splitLines(toPrinterText(ln.text), cols)) {
+          ops.push(lineOp(align ? part.trim() : part, { align, bold: Boolean(ln.bold), size }));
+        }
+        break;
+      }
+      case 'row': {
+        const k = toPrinterText(ln.left).trim();
+        const v = toPrinterText(ln.right).trim();
+        const style = { bold: Boolean(ln.bold) };
+        if (k.length + 1 + v.length <= w) {
+          ops.push(lineOp(k + ' '.repeat(w - k.length - v.length) + v, style));
+        } else {
+          for (const part of splitLines(k, w)) ops.push(lineOp(part, style));
+          for (const part of splitLines(v, w)) ops.push(lineOp(part.trim().padStart(w), style));
+        }
+        break;
+      }
+      case 'divider': {
+        const ch = toPrinterText(ln.ch || '-').trim()[0] || '-';
+        ops.push(lineOp(ch.repeat(w)));
+        break;
+      }
+      case 'blank':
+        for (let i = 0; i < Math.max(0, Number(ln.n ?? 1) || 0); i++) ops.push(lineOp(''));
+        break;
+      case 'feed': ops.push({ op: 'feed', n: Math.max(1, Number(ln.n) || 1) }); break;
+      case 'barcode': {
+        const text = toPrinterText(ln.text).slice(0, 20);
+        if (text) ops.push({ op: 'barcode', text });
+        break;
+      }
+      case 'cut': ops.push({ op: 'cut' }); break;
+      default: break;
+    }
+  }
+  return ops;
 }
 
 /**
- * Переводит строку UTF-8 в буфер байтов в кодировке CP866 (DOS Cyrillic).
- * Символы вне CP866 заменяются на '?'.
+ * Чек обычным текстом — ровно те символы, что лягут на бумагу. Двойная
+ * ширина показана буквами через пробел (каждая занимает две колонки).
+ * Нужен для предпросмотра в интерфейсе и для тестов.
  */
-function toCp866(str) {
-  const bytes = [];
-  for (const ch of str) {
-    const code = ch.charCodeAt(0);
-    if (code < 0x80) { bytes.push(code); continue; }
-    // Ё ё
-    if (code === 0x0401) { bytes.push(0xf0); continue; }
-    if (code === 0x0451) { bytes.push(0xf1); continue; }
-    // А-Я (U+0410..U+042F) → 0x80..0x9F
-    if (code >= 0x0410 && code <= 0x042f) { bytes.push(0x80 + (code - 0x0410)); continue; }
-    // а-п (U+0430..U+043F) → 0xA0..0xAF  (в CP866 р начинается с 0xE0? Уточним классическую таблицу)
-    if (code >= 0x0430 && code <= 0x043f) { bytes.push(0xa0 + (code - 0x0430)); continue; }
-    // р-я (U+0440..U+044F) → 0xE0..0xEF
-    if (code >= 0x0440 && code <= 0x044f) { bytes.push(0xe0 + (code - 0x0440)); continue; }
-    // №
-    if (code === 0x2116) { bytes.push(0xd9); continue; }
-    // « » — кавычки-ёлочки
-    if (code === 0x00ab) { bytes.push(0xae); continue; }
-    if (code === 0x00bb) { bytes.push(0xaf); continue; }
-    bytes.push(0x3f); // '?'
+export function renderReceiptText(lines, width = DEFAULT_WIDTH) {
+  const w = clampWidth(width);
+  const out = [];
+  for (const op of layoutReceipt(lines, w)) {
+    if (op.op === 'line') {
+      const wide = isDoubleWidth(op.size);
+      const cols = wide ? op.text.length * 2 : op.text.length;
+      const shown = wide ? Array.from(op.text, (c) => `${c} `).join('').trimEnd() : op.text;
+      const padLeft = op.align === 1 ? Math.floor((w - cols) / 2) : op.align === 2 ? w - cols : 0;
+      out.push((' '.repeat(Math.max(0, padLeft)) + shown).trimEnd());
+    } else if (op.op === 'barcode') {
+      const label = `[barcode ${op.text}]`;
+      out.push(' '.repeat(Math.max(0, Math.floor((w - label.length) / 2))) + label);
+    } else if (op.op === 'feed') {
+      for (let i = 0; i < op.n; i++) out.push('');
+    }
   }
-  return Buffer.from(bytes);
+  // хвостовые пустые строки (подача перед отрезом) в предпросмотре не нужны
+  while (out.length && !out[out.length - 1]) out.pop();
+  return out;
 }
 
-/** Подготовка строки для вывода: \n уже внутри превращаем в LF; перевод табов в пробелы. */
-function lineToBuf(line, opts) {
-  const text = String(line ?? '').replace(/\t/g, '    ');
-  if (opts?.ascii) return Buffer.from(translitRu(text), 'ascii');
-  return toCp866(text);
-}
-
-function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+function sleep(ms) { return ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.resolve(); }
 
 // ========================================================================
 // ReceiptPrinter
@@ -127,19 +258,17 @@ function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 export class ReceiptPrinter {
   /**
-   * @param {{path:string, baudRate?:number, ascii?:boolean, charPage?:number, width?:number}} opts
-   *   path       — последовательный порт принтера (напр. /dev/ttyUSB1)
+   * @param {{path:string, baudRate?:number, width?:number, cmdDelayMs?:number}} opts
+   *   path       — последовательный порт принтера (напр. /dev/ttyUSB1, COM4)
    *   baudRate   — скорость UART, по умолчанию 9600
-   *   ascii      — true, если у принтера нет кириллицы (печатаем транслитом)
-   *   charPage   — кодовая страница ESC t, по умолчанию 17 (CP866)
    *   width      — ширина строки в символах (по умолчанию 32 для 58 мм бумаги)
+   *   cmdDelayMs — пауза после каждой посылки (медленным принтерам), по умолчанию 20 мс
    */
-  constructor({ path, baudRate = DEFAULT_BAUD, ascii = false, charPage = 17, width = 32 } = {}) {
+  constructor({ path, baudRate = DEFAULT_BAUD, width = DEFAULT_WIDTH, cmdDelayMs = CMD_DELAY_MS } = {}) {
     this.path = path;
     this.baudRate = Number(baudRate) || DEFAULT_BAUD;
-    this.ascii = Boolean(ascii);
-    this.charPage = charPage;
-    this.width = Number(width) || 32;
+    this.width = clampWidth(width);
+    this.cmdDelayMs = Math.max(0, Number(cmdDelayMs) || 0);
     this.port = null;
     this._busy = null;
   }
@@ -187,26 +316,27 @@ export class ReceiptPrinter {
         this.port.drain((de) => (de ? reject(de) : resolve()));
       });
     });
-    await sleep(CMD_DELAY_MS);
+    await sleep(this.cmdDelayMs);
   }
 
   // ---------- примитивы ----------
 
-  async init() { await this.send(CMD_INIT); await this.send(CMD_CHARSET(this.ascii ? 2 : this.charPage)); }
-  async align(n) { await this.send(CMD_ALIGN(n)); }       // 0=left 1=center 2=right
+  async init() {
+    await this.send(CMD_INIT);
+    await this.send(Buffer.concat([CMD_INTL_USA, CMD_CODEPAGE_PC437]));
+  }
+  async align(n) { await this.send(CMD_ALIGN(alignCode(n))); }   // 0=left 1=center 2=right
   async bold(on) { await this.send(CMD_BOLD(on ? 1 : 0)); }
   /** size: 0 обычный, 'big' двойной размер, 'wide' двойная ширина, 'tall' двойная высота */
-  async font(size = 0) {
-    const n = size === 'big' ? 0x11 : size === 'wide' ? 0x01 : size === 'tall' ? 0x10 : 0x00;
-    await this.send(CMD_SIZE(n));
-  }
+  async font(size = 0) { await this.send(CMD_SIZE(sizeCode(size))); }
 
-  async writeLine(text, opts = {}) {
-    await this.send(Buffer.concat([lineToBuf(text, { ascii: this.ascii }), Buffer.from([LF])]));
+  /** Одна строка текста (любой текст приводится к печатному ASCII). */
+  async writeLine(text) {
+    await this.send(Buffer.concat([asciiBytes(text), Buffer.from([LF])]));
   }
 
   async divider(ch = '-') {
-    await this.writeLine((ch[0] || '-').repeat(this.width));
+    await this.writeLine((toPrinterText(ch).trim()[0] || '-').repeat(this.width));
   }
 
   async blank(n = 1) {
@@ -217,106 +347,52 @@ export class ReceiptPrinter {
     await this.feed(FEED_LINES);
     // команда отреза может не поддерживаться — отправляем, не ругаемся, если не сработает
     try { await this.send(CMD_CUT_PART); } catch { /* игнорируем */ }
-    await sleep(120);
+    await sleep(Math.min(120, this.cmdDelayMs * 6));
   }
 
   async feed(n) { await this.send(feed(n)); }
 
   /**
-   * Печатает последовательность команд (массив объектов) на чек.
-   * Поддерживаемые команды:
-   *   { t: 'text', text, align?, bold?, size? }
-   *   { t: 'row', left, right }        — таблица из двух колонок (key/value)
-   *   { t: 'divider', ch? }            — разделитель
-   *   { t: 'blank', n? }
-   *   { t: 'barcode', text }           — CODE128
-   *   { t: 'cut' }
-   *   { t: 'feed', n }
+   * Печатает чек: массив команд (см. layoutReceipt). В конце — подача и отрез,
+   * если чек сам не закончился командой { t: 'cut' }.
    */
   async printLines(lines) {
-    if (!this.isOpen) await this.open();
-    // сериализуем вызовы, чтобы медленный принтер не потерял байты
-    const busy = (this._busy || Promise.resolve()).then(async () => {
+    const ops = layoutReceipt(lines, this.width);
+    const run = async () => {
+      if (!this.isOpen) await this.open();
       await this.init();
-      await this.align(0);
-      await this.bold(false);
-      await this.font(0);
-      for (const ln of lines) {
-        switch (ln?.t) {
-          case 'text': {
-            if (ln.align !== undefined) await this.align(ln.align);
-            await this.bold(Boolean(ln.bold));
-            await this.font(ln.size || 0);
-            for (const part of splitLines(String(ln.text ?? ''), this.width * (ln.size === 'big' || ln.size === 'wide' ? 1 : 1))) {
-              await this.writeLine(part);
-            }
-            // сброс к дефолту после каждой строки с форматированием
-            await this.font(0);
-            await this.bold(false);
-            await this.align(0);
-            break;
-          }
-          case 'row': {
-            await this.align(0);
-            await this.bold(Boolean(ln.bold));
-            const k = String(ln.left ?? '');
-            const v = String(ln.right ?? '');
-            const pad = Math.max(1, this.width - realLen(k) - realLen(v));
-            await this.writeLine(k + ' '.repeat(pad) + v);
-            await this.bold(false);
-            break;
-          }
-          case 'divider': await this.divider(ln.ch); break;
-          case 'blank': await this.blank(ln.n ?? 1); break;
-          case 'feed': await this.feed(Math.max(1, Number(ln.n) || 1)); break;
-          case 'barcode':
-            try {
-              await this.align(1);
-              await this.send(barcode128(String(ln.text).slice(0, 20).replace(/[^\x20-\x7e]/g, '')));
-              await this.feed(2);
-              await this.align(0);
-            } catch { /* нет штрих-кода — не критично */ }
-            break;
-          case 'cut': await this.cut(); break;
-          default:
-            if (typeof ln === 'string') await this.writeLine(ln);
+      // после ESC @ принтер в состоянии по умолчанию; форматирование шлём только при смене
+      const cur = { align: 0, bold: false, size: 0 };
+      const style = async (align, bold, size) => {
+        if (align !== cur.align) { await this.align(align); cur.align = align; }
+        if (bold !== cur.bold) { await this.bold(bold); cur.bold = bold; }
+        if (sizeCode(size) !== sizeCode(cur.size)) { await this.font(size); cur.size = size; }
+      };
+      for (const op of ops) {
+        if (op.op === 'line') {
+          await style(op.align, op.bold, op.size);
+          await this.writeLine(op.text);
+        } else if (op.op === 'feed') {
+          await this.feed(op.n);
+        } else if (op.op === 'barcode') {
+          try {
+            await style(1, false, 0);
+            await this.send(barcode128(op.text));
+            await this.feed(2);
+          } catch { /* нет штрих-кода — не критично */ }
+        } else if (op.op === 'cut') {
+          await style(0, false, 0);
+          await this.cut();
         }
       }
-      await this.cut();
-    }).catch((e) => { throw e; });
+      await style(0, false, 0);
+      if (ops[ops.length - 1]?.op !== 'cut') await this.cut();
+    };
+    // сериализуем вызовы, чтобы медленный принтер не потерял байты
+    const busy = (this._busy || Promise.resolve()).then(run);
     this._busy = busy.catch(() => {});
     return busy;
   }
-}
-
-/** Длина строки с учётом宽их символов СР866 (кириллица и латиница там одной ширины). */
-function realLen(s) {
-  // Упрощённо: все печатные — одна позиция; двойная ширина включается командой size=wide.
-  return Array.from(String(s)).length;
-}
-
-/** Наивный перенос длинных строк по ширине (по пробелам). */
-function splitLines(text, width) {
-  const out = [];
-  for (const raw of String(text).split(/\r?\n/)) {
-    if (realLen(raw) <= width) { out.push(raw); continue; }
-    // разбиваем по пробелам
-    const words = raw.split(/(\s+)/);
-    let cur = '';
-    for (const w of words) {
-      if (realLen(cur + w) > width && cur.trim()) { out.push(cur.trimEnd()); cur = w.trimStart(); }
-      else cur += w;
-      if (realLen(cur) > width) {
-        // слово длиннее ширины — режем жёстко
-        while (realLen(cur) > width) {
-          out.push(cur.slice(0, width));
-          cur = cur.slice(width);
-        }
-      }
-    }
-    if (cur) out.push(cur);
-  }
-  return out.length ? out : [''];
 }
 
 /** Стандартные скорости для подбора в UI. */
