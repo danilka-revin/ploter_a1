@@ -384,13 +384,20 @@ export interface PrinterStatus {
   configured: boolean;
   path: string;
   baudRate: number;
-  ascii: boolean;
-  charPage: number;
   width: number;
+  /** язык чека: всегда английский (только ASCII — печатается любым принтером) */
+  language: 'en';
   open: boolean;
   lastError: string;
   lastPrintAt: number;
   bauds: number[];
+}
+
+/** Чек обычным текстом, как он ляжет на бумагу (GET /api/printer/preview). */
+export interface PrinterPreview {
+  kind: 'bank' | 'fleet' | 'test';
+  width: number;
+  lines: string[];
 }
 
 export interface PrintResult {

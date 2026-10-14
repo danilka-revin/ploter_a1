@@ -133,6 +133,9 @@ test('плитки панели рендерятся: акцент на банк
   assert.match(connect, /Демо-банки/);
   assert.match(connect, /в отчёте 2 банка/);
   assert.doesNotMatch(connect, /доступных регистров/, 'каталог сырых регистров не показывается');
+  assert.match(connect, /чек на английском/, 'видно, что чек печатается на английском');
+  assert.match(connect, /предпросмотр чека/, 'есть предпросмотр чека без печати');
+  assert.doesNotMatch(connect, /только латиница|CP866/, 'настройки кириллицы для принтера убраны');
   const jr = m.renderJournal();
   assert.match(jr, /Записано 2 пар\./);
   assert.match(jr, /связь потеряна/);

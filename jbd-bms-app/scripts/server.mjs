@@ -32,9 +32,11 @@
 //   GET  /api/catalog                     — описания регистров, настроек и команд
 //   POST /api/poll {ms}                    — задать период опроса
 //   GET  /api/printer                     — статус TTL-чекового принтера
-//   POST /api/printer/config              — настройки принтера (порт, скорость, кодировка)
+//   POST /api/printer/config              — настройки принтера (порт, скорость, ширина строки)
 //   POST /api/printer/test                — пробная страница
 //   POST /api/printer/print {id}          — печать сводки по банку (id=all — по парку)
+//   GET  /api/printer/preview?id=         — тот же чек текстом, без печати (id=all — парк, id=test — пробная)
+//   Чеки печатаются на английском и только ASCII — так их понимает любой принтер.
 //
 // Старые одиночные адреса сохранены: /api/connect, /api/disconnect, /api/state,
 // /api/snapshot, /api/settings, /api/settings/write, /api/control/*, /api/backup*,
@@ -407,6 +409,16 @@ async function handleApi(req, res, url) {
     // обновляем данные, если банк на связи; не падаем, если опрос не удался — печатаем то, что есть
     if (bank.connected) await banks.pollOne(bank).catch(() => {});
     return send(res, 200, await printer.printBank(banks.row(bank), banks.fleet()));
+  }
+  if (method === 'GET' && pathname === '/api/printer/preview') {
+    const id = q.get('id') || 'all';
+    if (id === 'test') return send(res, 200, printer.previewTest());
+    if (id === 'all') {
+      const rows = banks.list().map((b) => banks.row(b));
+      if (!rows.length) throw httpError(409, 'NO_BANK', 'Нет подключённых аккумуляторов.');
+      return send(res, 200, printer.previewFleet(rows, banks.fleet()));
+    }
+    return send(res, 200, printer.previewBank(banks.row(banks.get(id)), banks.fleet()));
   }
 
   // ----- прошивка -----
