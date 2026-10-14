@@ -263,6 +263,7 @@ export class BankManager {
     const b = bank.basic;
     if (!b) return;
     const st = bank.cells?.stats;
+    const cells = bank.cells?.values ? [...bank.cells.values] : [];
     const sample = {
       t: bank.at,
       v: round(b.packVoltage, 2),
@@ -272,7 +273,9 @@ export class BankManager {
       rem: round(b.remainingAh, 2),
       min: st?.min ?? null,
       max: st?.max ?? null,
+      avg: st?.avg ?? null,
       delta: st?.delta ?? null,
+      cells,
       temps: b.temperatures.map((t) => round(t, 1)),
       bal: b.balancingCells.length,
       faults: b.faultRaw,
@@ -334,12 +337,14 @@ export class BankManager {
     const step = Math.max(1, Math.ceil(src.length / Math.max(8, points)));
     const picked = src.filter((_, i) => i % step === 0 || i === src.length - 1);
     const nTemp = Math.max(1, ...picked.map((s) => s.temps.length));
+    const nCells = Math.max(0, ...picked.map((s) => (s.cells ? s.cells.length : 0)));
     const t = picked.map((s) => s.t);
     const at = (key) => picked.map((s) => s[key]);
     return {
       t,
       v: at('v'), a: at('a'), w: at('w'), soc: at('soc'), rem: at('rem'), delta: at('delta'),
-      min: at('min'), max: at('max'), bal: at('bal'), faults: at('faults'),
+      min: at('min'), max: at('max'), avg: at('avg'), bal: at('bal'), faults: at('faults'),
+      cells: Array.from({ length: nCells }, (_, i) => picked.map((s) => (s.cells?.[i] ?? null))),
       temps: Array.from({ length: nTemp }, (_, i) => picked.map((s) => (s.temps[i] ?? null))),
       step,
       samples: src.length,
@@ -357,6 +362,7 @@ export class BankManager {
     const picked = samples.filter((_, i) => i % step === 0 || i === samples.length - 1);
     const at = (t0) => {
       let a = 0, w = 0, v = 0, soc = 0, delta = 0, rem = 0, n = 0, bal = 0;
+      let cellMin = Infinity, cellMax = -Infinity, cellAvgSum = 0, cellAvgN = 0;
       let faults = 0;
       const temps = [null, null, null, null];
       for (const bank of banks) {
@@ -370,6 +376,9 @@ export class BankManager {
         delta += h.delta ?? 0;
         rem += h.rem ?? 0;
         bal += h.bal ?? 0;
+        if (h.min !== null && h.min !== undefined && h.min < cellMin) cellMin = h.min;
+        if (h.max !== null && h.max !== undefined && h.max > cellMax) cellMax = h.max;
+        if (h.avg !== null && h.avg !== undefined) { cellAvgSum += h.avg; cellAvgN++; }
         if (h.faults) faults++;
         (h.temps ?? []).forEach((t, i) => {
           if (t === null || t === undefined) return;
@@ -380,6 +389,9 @@ export class BankManager {
       return {
         a: round(a, 2), w: round(w, 1), v: round(v / n, 2), soc: round(soc / n, 1),
         delta: round(delta / n, 0), rem: round(rem, 2), bal, faults,
+        min: Number.isFinite(cellMin) ? cellMin : null,
+        max: Number.isFinite(cellMax) ? cellMax : null,
+        avg: cellAvgN ? Math.round(cellAvgSum / cellAvgN) : null,
         temps: temps.map((t) => (t === null ? null : round(t, 1))),
       };
     };
@@ -388,7 +400,7 @@ export class BankManager {
     return {
       t: rows.map((r) => r.t),
       v: col('v'), a: col('a'), w: col('w'), soc: col('soc'), rem: col('rem'), delta: col('delta'),
-      min: [], max: [], bal: col('bal'), faults: col('faults'),
+      min: col('min'), max: col('max'), avg: col('avg'), cells: [], bal: col('bal'), faults: col('faults'),
       temps: [0, 1, 2, 3].map((i) => rows.map((r) => r.temps[i])),
       step,
       samples: samples.length,

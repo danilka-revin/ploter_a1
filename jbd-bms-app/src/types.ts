@@ -250,6 +250,8 @@ export interface Series {
   delta: (number | null)[];
   min: (number | null)[];
   max: (number | null)[];
+  avg?: (number | null)[];
+  cells?: (number | null)[][];
   bal: (number | null)[];
   faults: (number | null)[];
   temps: (number | null)[][];
