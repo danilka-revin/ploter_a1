@@ -1,21 +1,18 @@
 // Большая панель BMS: один экран, без прокрутки страницы.
 //
-//  • сверху — строка состояния парка (В, А, Вт, SOC, защиты) и настройки опроса;
-//  • «Отчёт по всем банкам» — таблица со всеми ключевыми числами и мини-графиком на строку;
-//  • графики (напряжение/ток, мощность, температуры, разброс ячеек и заряд) по выбранному
-//    банку или по парку целиком;
-//  • справа — плитка «Плата: все данные и настройки» (читаем 0x00…0xFF и пишем EEPROM);
-//  • снизу — управление (ключи, балансировка, остаток, сбросы) и консоль сырых регистров;
+//  • сверху — сводка по банкам в аккумуляторе (схема, мин/макс, разброс Δ, В, А, SOC, защиты);
+//  • «Банки в аккумуляторе» — главный блок: сводка по ячейкам и карточка каждой банки #1…#N;
+//  • «Графики» — все графики в едином визуальном стиле с акцентом на банки аккумулятора;
+//  • «Отчёт по всем банкам» и «Порты и подключение» — работа с одной или несколькими платами;
+//  • справа — «Плата: все данные и настройки» (сводка, пороги защит и прошивка без сырых регистров);
+//  • снизу — «Управление» (ключи заряда/разряда, балансировка, ёмкость, сбросы и резервные копии);
 //  • журнал событий — в нижней строке, открывается по клику.
-//
-// Страница не скроллится: плитки прокручиваются внутри себя. Клавиши: F — полный экран,
-// D — демо-банки, S — найти все платы, 1…9 — выбрать банк, J — журнал, Esc — закрыть.
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from './api';
 import { useCockpit } from './store';
 import { Tile, Btn, Chip, num } from './views/Tile';
-import { BankTable, C, Charts, ConnectTile, KpiStrip } from './views/Report';
-import { ControlTile, ConsoleTile, Journal } from './views/Ops';
+import { BankTable, C, CellsTile, Charts, ConnectTile, KpiStrip } from './views/Report';
+import { ControlTile, Journal } from './views/Ops';
 import { DataTile } from './views/Editor';
 import { UpdateDialog } from './views/UpdateDialog';
 import { Icon } from './icons';
@@ -38,12 +35,18 @@ export default function App() {
   const [health, setHealth] = useState<Health | null>(null);
   const [update, setUpdate] = useState<UpdateSnapshot | null>(null);
   const [updOpen, setUpdOpen] = useState(false);
+  const [pickedCell, setPickedCell] = useState<number | null>(null);
 
   const cockpit = useCockpit();
   const { panel, catalog, focus, focusBank, series, registers } = cockpit;
   const banks = panel?.banks ?? [];
   const fleet = panel?.fleet;
   const isFleet = focus === FLEET || (!focus && banks.length > 1);
+  const activeBank = focusBank ?? banks[0] ?? null;
+
+  useEffect(() => {
+    setPickedCell(null);
+  }, [activeBank?.id]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -93,7 +96,7 @@ export default function App() {
     const onKey = (e: KeyboardEvent) => {
       const el = e.target as HTMLElement | null;
       if (el && /input|select|textarea/i.test(el.tagName)) return;
-      if (e.key === 'Escape') { setJournalOpen(false); return; }
+      if (e.key === 'Escape') { setJournalOpen(false); setPickedCell(null); return; }
       const k = e.key.toLowerCase();
       if (k === 'f' || e.key === 'F11') {
         e.preventDefault();
@@ -114,20 +117,22 @@ export default function App() {
   const faultLabels = useMemo(() => Object.fromEntries((catalog?.faults ?? []).map((f) => [f.key, f.label])), [catalog]);
   const alertCount = (fleet?.faults ?? 0) + banks.filter((b) => !b.connected).length;
   const lastMsg = cockpit.log[0];
+  const cellDelta = activeBank?.stats?.delta ?? fleet?.cellDelta ?? null;
 
   return (
     <div className="dash" data-alert={alertCount > 0 ? '1' : '0'}>
       <header className="bar" data-area="bar">
         <div className="brand" title="JBD / Xiaoxiang BMS · UART 9600 8N1">
           <img src="logo.png" alt="" />
-          <b>JBD <em>BMS</em> <span>PANEL</span></b>
+          <b>JBD <em>BMS</em> <span>CELLS</span></b>
         </div>
 
         <div className="bar-kpis">
-          <span className="bk"><i>банков</i><b>{fleet ? `${fleet.online}/${fleet.banks}` : '0/0'}</b></span>
-          <span className="bk"><i>суммарно</i><b>{num(fleet?.currentSum ?? null, 1)} А · {num(fleet?.powerSum ?? null, 0)} Вт</b></span>
-          <span className="bk"><i>среднее</i><b>{num(fleet?.voltageAvg ?? null, 2)} В · {num(fleet?.socAvg ?? null, 0)}%</b></span>
-          <span className="bk"><i>разброс</i><b className={(fleet?.cellDelta ?? 0) > 30 ? 'warn' : ''}>{fleet?.cellDelta ?? '—'} мВ</b></span>
+          <span className="bk"><i>банок в акуме</i><b>{activeBank?.cellCount ? `${activeBank.cellCount}S` : (fleet ? `${fleet.online}/${fleet.banks}` : '0')}</b></span>
+          <span className="bk"><i>мин · макс банок</i><b>{activeBank?.stats ? `${(activeBank.stats.min / 1000).toFixed(3)}·${(activeBank.stats.max / 1000).toFixed(3)} В` : '—'}</b></span>
+          <span className="bk"><i>разброс Δ</i><b className={(cellDelta ?? 0) > 30 ? 'warn' : ''}>{cellDelta ?? '—'} мВ</b></span>
+          <span className="bk"><i>аккумулятор</i><b>{num(activeBank?.voltage ?? fleet?.voltageAvg ?? null, 2)} В · {num(activeBank?.current ?? fleet?.currentSum ?? null, 1)} А</b></span>
+          <span className="bk"><i>заряд · мощн.</i><b>{num(activeBank?.soc ?? fleet?.socAvg ?? null, 0)}% · {num(activeBank?.power ?? fleet?.powerSum ?? null, 0)} Вт</b></span>
           <span className="bk"><i>T макс</i><b>{num(fleet?.tempMax ?? null, 1)} °C</b></span>
           <span className={`bk ${alertCount ? 'bad' : 'ok'}`}><i>защиты</i><b>{fleet?.faults ?? 0}</b></span>
         </div>
@@ -144,7 +149,7 @@ export default function App() {
             ))}
           </span>
           <Btn small onClick={cockpit.exportCsv} title="Отчёт по всем банкам в CSV">CSV отчёт</Btn>
-          <Btn small onClick={cockpit.exportJson} title="Полный отчёт (все регистры) в JSON">JSON</Btn>
+          <Btn small onClick={cockpit.exportJson} title="Полный отчёт в JSON">JSON</Btn>
           <button className="ic" onClick={() => setDensity(density === 'compact' ? 'roomy' : 'compact')} title="Плотность панели">{density === 'compact' ? '⤡' : '⤢'}</button>
           <button className="ic" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')} title="Тема">{theme === 'dark' ? '☀' : '☾'}</button>
           <button className="ic" onClick={() => document.documentElement.requestFullscreen?.().catch(() => {})} title="Полный экран (F)">⛶</button>
@@ -153,8 +158,36 @@ export default function App() {
       </header>
 
       <Tile
+        title="Банки в аккумуляторе" area="cel"
+        hint={activeBank
+          ? `${activeBank.label} · ${activeBank.cellCount || activeBank.cells.length} банок · клик по банке выделяет её на графике`
+          : 'подключите плату или включите демо'}
+        tools={
+          <span className="chips">
+            {pickedCell !== null && (
+              <Chip on onClick={() => setPickedCell(null)} title="Сбросить выбор банки">
+                банка #{pickedCell + 1} ✕
+              </Chip>
+            )}
+            {banks.map((b) => (
+              <Chip key={b.id} on={activeBank?.id === b.id} onClick={() => cockpit.setFocus(b.id)} title={`${b.path} · ${b.deviceName}`}>
+                <i className="dot" style={{ background: b.connected ? C.soc : C.bad }} />{b.label}
+              </Chip>
+            ))}
+          </span>
+        }
+      >
+        <CellsTile
+          bank={activeBank}
+          registers={registers}
+          pickedCell={pickedCell}
+          onPickCell={setPickedCell}
+        />
+      </Tile>
+
+      <Tile
         title="Отчёт по всем банкам" area="rep"
-        hint={banks.length ? `${banks.length} плат(ы) · клик по строке — выбрать банк · двойной клик по имени — переименовать` : 'нет подключённых банков'}
+        hint={banks.length ? `${banks.length} плат(ы) · клик — выбрать · двойной клик — переименовать` : 'нет подключённых плат'}
         tools={<Btn small onClick={() => cockpit.refresh(focus)} title="Обновить данные сейчас">↻</Btn>}
       >
         <BankTable
@@ -167,20 +200,9 @@ export default function App() {
         />
       </Tile>
 
-      <Tile title="Порты и подключение" area="cnc" hint="USB–UART 9600 8N1">
-        <ConnectTile
-          ports={cockpit.ports} selected={cockpit.selected} onSelect={cockpit.setSelected}
-          onConnect={() => cockpit.addBank(cockpit.selected)}
-          onFind={cockpit.findAndConnectAll}
-          onDemo={cockpit.addDemo}
-          busy={cockpit.busy} scanning={cockpit.scanning}
-          banks={banks} catalog={catalog}
-        />
-      </Tile>
-
       <Tile
         title="Графики" area="cht"
-        hint={`окно ${Math.round(cockpit.windowSec / 60)} мин · курсор по графику показывает значения`}
+        hint={`единый стиль · окно ${Math.round(cockpit.windowSec / 60)} мин · курсор по графику показывает значения`}
         tools={
           <span className="chips">
             <Chip on={isFleet} onClick={() => cockpit.setFocus(FLEET)} title="сводка по всему парку">весь парк</Chip>
@@ -193,12 +215,19 @@ export default function App() {
         }
       >
         <KpiStrip panel={panel} bank={isFleet ? null : focusBank} series={series} isFleet={isFleet || !focusBank} />
-        <Charts series={series} bank={isFleet ? banks[0] ?? null : focusBank} catalog={catalog} registers={registers} />
+        <Charts
+          series={series}
+          bank={activeBank}
+          catalog={catalog}
+          registers={registers}
+          pickedCell={pickedCell}
+          onPickCell={setPickedCell}
+        />
       </Tile>
 
       <Tile
         title="Плата: все данные и настройки" area="dat"
-        hint={focusBank ? `банк ${focusBank.label}${registers ? ` · ${registers.settings.length} регистров` : ''}` : 'банк не выбран'}
+        hint={focusBank ? `${focusBank.label}${focusBank.cellCount ? ` · ${focusBank.cellCount}S` : ''}` : 'банк не выбран'}
       >
         <DataTile
           registers={registers} catalog={catalog} busy={cockpit.busy}
@@ -215,11 +244,14 @@ export default function App() {
         />
       </Tile>
 
-      <Tile title="Консоль регистров" area="con" hint="читать и писать любой регистр 0x00–0xFF">
-        <ConsoleTile
-          catalog={catalog} bank={focusBank} busy={cockpit.busy}
-          rawRead={(regs) => cockpit.rawRead(regs, focusBank?.id)}
-          rawWrite={cockpit.rawWrite}
+      <Tile title="Порты и подключение" area="cnc" hint="USB–UART 9600 8N1">
+        <ConnectTile
+          ports={cockpit.ports} selected={cockpit.selected} onSelect={cockpit.setSelected}
+          onConnect={() => cockpit.addBank(cockpit.selected)}
+          onFind={cockpit.findAndConnectAll}
+          onDemo={cockpit.addDemo}
+          busy={cockpit.busy} scanning={cockpit.scanning}
+          banks={banks} catalog={catalog}
         />
       </Tile>
 
@@ -229,7 +261,7 @@ export default function App() {
         {cockpit.error ? <span className="err-line">{cockpit.error}</span> : lastMsg ? <span className="muted">{new Date(lastMsg.at).toLocaleTimeString('ru-RU')} · {lastMsg.text}</span> : null}
         <span className="sp" />
         {update?.updateAvailable && <button className="linkish" onClick={(e) => { e.stopPropagation(); setUpdOpen(true); }}>есть обновление</button>}
-        <span className="muted">журнал (J) · F — полный экран · 1…9 — банк</span>
+        <span className="muted">журнал (J) · F — полный экран · 1…9 — акум</span>
         <span className="muted">v{health?.app ?? '—'}{health?.commit ? ` · ${health.commit}` : ''}</span>
       </footer>
 

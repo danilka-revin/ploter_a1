@@ -3,8 +3,8 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { Firmware } from '../src/views/Firmware';
 import { UpdateDialog } from '../src/views/UpdateDialog';
 import { DataBody, DataTile, SettingsBody } from '../src/views/Editor';
-import { BankTable, Charts, ConnectTile, KpiStrip } from '../src/views/Report';
-import { ConsoleTile, ControlTile, Journal } from '../src/views/Ops';
+import { BankTable, CellsTile, Charts, ConnectTile, KpiStrip } from '../src/views/Report';
+import { ControlTile, Journal } from '../src/views/Ops';
 import App from '../src/App';
 import type { BankRegisters, BankRow, Catalog, FirmwareInfo, Panel, Series, UpdateSnapshot } from '../src/types';
 
@@ -18,6 +18,8 @@ const series: Series = {
   delta: [18, 21, 24, 22],
   min: [3300, 3298, 3295, 3297],
   max: [3318, 3319, 3319, 3319],
+  avg: [3312, 3313, 3311, 3314],
+  cells: Array.from({ length: 12 }, (_, i) => [3310 + i, 3311 + i, 3309 + i, 3312 + i]),
   bal: [1, 1, 0, 1],
   faults: [0, 0, 0, 0],
   temps: [[25.4, 25.6, 26.1, 26.4], [26.1, 26.2, 26.8, 27.0], [24.1, 24.2, 24.4, 24.5], []],
@@ -94,6 +96,12 @@ const catalog: Catalog = {
 const noop = async () => null;
 
 export const renderApp = () => renderToStaticMarkup(<App />);
+export const renderCells = () => renderToStaticMarkup(
+  <CellsTile bank={bank} registers={registers} pickedCell={2} onPickCell={() => {}} />,
+);
+export const renderCellsEmpty = () => renderToStaticMarkup(
+  <CellsTile bank={null} registers={null} />,
+);
 export const renderBanks = () => renderToStaticMarkup(
   <BankTable banks={banks} focus="b1" faultLabels={{ covp: 'Перенапряжение ячейки' }}
     onFocus={() => {}} onRename={() => {}} onReconnect={() => {}} onRemove={() => {}} />,
@@ -103,7 +111,7 @@ export const renderBanksEmpty = () => renderToStaticMarkup(
 );
 export const renderKpis = () => renderToStaticMarkup(<KpiStrip panel={panel} bank={bank} series={series} isFleet={false} />);
 export const renderKpisFleet = () => renderToStaticMarkup(<KpiStrip panel={panel} bank={null} series={series} isFleet />);
-export const renderCharts = () => renderToStaticMarkup(<Charts series={series} bank={bank} catalog={catalog} registers={registers} />);
+export const renderCharts = () => renderToStaticMarkup(<Charts series={series} bank={bank} catalog={catalog} registers={registers} pickedCell={2} />);
 export const renderChartsNoData = () => renderToStaticMarkup(<Charts series={{ ...series, t: [], v: [] } as any} bank={null} catalog={catalog} registers={null} />);
 export const renderDataTile = () => renderToStaticMarkup(
   <DataTile registers={registers} catalog={catalog} busy={null} bankName="BANK A" onRead={() => {}} onWrite={async () => null} />,
@@ -121,16 +129,13 @@ export const renderControl = () => renderToStaticMarkup(
 export const renderControlDisconnected = () => renderToStaticMarkup(
   <ControlTile bank={deadBank} busy={null} control={noop as any} catalog={catalog} onBackup={() => {}} onRestore={() => {}} panel={panel} />,
 );
-export const renderConsole = () => renderToStaticMarkup(
-  <ConsoleTile catalog={catalog} bank={bank} busy={null} rawRead={noop as any} rawWrite={noop as any} />,
-);
 export const renderConnect = () => renderToStaticMarkup(
   <ConnectTile ports={[{ path: '/dev/ttyUSB0', label: '/dev/ttyUSB0 · CH340' }, { path: '/dev/ttyUSB1', label: '/dev/ttyUSB1 · CP210x', used: true } as any]}
     selected="/dev/ttyUSB0" onSelect={() => {}} onConnect={() => {}} onFind={() => {}} onDemo={() => {}}
     busy={null} scanning={false} banks={banks} catalog={catalog} />,
 );
 export const renderJournal = () => renderToStaticMarkup(
-  <Journal log={[{ at: 4000, kind: 'err', text: 'Банк BANK B: связь потеряна' }, { at: 3000, kind: 'ok', text: 'Записано 2 рег.' }]} error="Банк BANK B: связь потеряна" />,
+  <Journal log={[{ at: 4000, kind: 'err', text: 'Банк BANK B: связь потеряна' }, { at: 3000, kind: 'ok', text: 'Записано 2 пар.' }]} error="Банк BANK B: связь потеряна" />,
 );
 
 const fwInfo: FirmwareInfo = {

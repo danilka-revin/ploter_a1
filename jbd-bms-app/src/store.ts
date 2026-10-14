@@ -127,7 +127,7 @@ export function useCockpit() {
 
   const setFocus = useCallback((id: string | null) => setFocusState(id), []);
 
-  // ----- данные одного банка (регистры, настройки) -----
+  // ----- данные одного банка (сводка, настройки) -----
   const readRegisters = useCallback(async (id: string | null) => {
     const target = id ?? focusBank?.id ?? null;
     if (!target) { note('err', 'Нет подключённого банка.'); return null; }
@@ -135,10 +135,10 @@ export function useCockpit() {
     try {
       const r = await api<BankRegisters>(`/api/bank/registers?id=${encodeURIComponent(target)}`, {}, 120_000);
       if (alive.current) setRegisters(r);
-      note('ok', `Банк ${labelOf(panel, target)}: прочитано ${r.settings?.length ?? 0} регистров настроек.`);
+      note('ok', `Банк ${labelOf(panel, target)}: параметры банок и настройки загружены.`);
       return r;
     } catch (e: any) {
-      note('err', e.message ?? 'Не удалось прочитать регистры');
+      note('err', e.message ?? 'Не удалось прочитать данные платы');
       return null;
     } finally {
       if (alive.current) setBusy(null);
