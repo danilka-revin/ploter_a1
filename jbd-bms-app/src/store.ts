@@ -76,7 +76,9 @@ export function useCockpit() {
       if (!alive.current) return;
       setPorts(r.ports);
       setDemoPort(r.demo);
-      setSelected((cur) => (cur && cur !== 'demo' && !r.ports.some((p) => p.path === cur) ? (r.ports[0]?.path ?? 'demo') : (cur || r.ports[0]?.path || 'demo')));
+      // порт принтера в списке есть (он нужен плитке принтера), но платой по умолчанию не выбираем
+      const firstFree = () => (r.ports.find((p) => !p.printer)?.path ?? r.ports[0]?.path ?? 'demo');
+      setSelected((cur) => (cur && cur !== 'demo' && !r.ports.some((p) => p.path === cur) ? firstFree() : (cur || firstFree())));
     } catch { /* сервер ещё не поднялся */ }
   }, []);
 
@@ -369,10 +371,12 @@ export function useCockpit() {
     try {
       const s = await api<PrinterStatus>('/api/printer/config', { method: 'POST', body: JSON.stringify(patch) }, 10_000);
       note('ok', `Принтер: ${s.path || 'порт не выбран'} @ ${s.baudRate}.`);
+      if (s.freedPort) note('info', `Порт ${s.freedPort} отключён от опроса платы — теперь это порт принтера (иначе опрос печатался бы вместо чека).`);
+      refreshPorts();
       return s;
     } catch (e: any) { note('err', e.message ?? 'Настройки принтера не сохранены.'); return null; }
     finally { if (alive.current) setBusy(null); }
-  }, [note]);
+  }, [note, refreshPorts]);
 
   const printerTest = useCallback(async () => {
     setBusy('printer-test');

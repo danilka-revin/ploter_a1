@@ -88,13 +88,15 @@ export function PrinterTile({
 
   const selectedBank = (focus && banks.find((b) => b.id === focus)) || banks[0] || null;
   const configured = Boolean(path);
-  const stateText = !status?.configured ? 'не настроен' : (status?.open ? 'подключён' : 'порт выбран');
+  // порт принтера занят платой: опрос BMS каждую секунду печатает кадры dd a5 03 … вместо чека
+  const portBusy = Boolean(status?.busy);
+  const stateText = !status?.configured ? 'не настроен' : portBusy ? 'порт занят платой' : (status?.open ? 'подключён' : 'порт выбран');
 
   return (
     <div className="printer-tile">
       <div className="printer-row">
         <span className="printer-state" title={status?.lastError || ''}>
-          <i className="dot" style={{ background: !status?.configured ? 'var(--warn)' : (status?.open ? 'var(--ok)' : 'var(--text-2)') }} />
+          <i className="dot" style={{ background: portBusy ? 'var(--danger)' : (!status?.configured ? 'var(--warn)' : (status?.open ? 'var(--ok)' : 'var(--text-2)')) }} />
           принтер: {stateText}
         </span>
         <span className="muted tiny" title="Чек печатается на английском только символами ASCII — их понимает любой принтер">чек на английском</span>
@@ -102,6 +104,15 @@ export function PrinterTile({
           {expanded ? 'свернуть ▴' : 'настроить ▾'}
         </button>
       </div>
+
+      {portBusy && (
+        <div className="banner err small">
+          Порт {status?.path} занят платой: опрос BMS печатается на принтере вместо чека.{' '}
+          <button type="button" className="linkish small" onClick={() => applyCfg({ path })}>
+            освободить порт принтера
+          </button>
+        </div>
+      )}
 
       <div className="printer-main">
         <select
@@ -113,7 +124,11 @@ export function PrinterTile({
         >
           <option value="">— выберите порт принтера —</option>
           {path && !ports.some((p) => p.path === path) && <option value={path}>{path}</option>}
-          {ports.map((p) => <option key={p.path} value={p.path}>{p.path}{p.used ? ' · занят банком' : ''}</option>)}
+          {ports.map((p) => (
+            <option key={p.path} value={p.path}>
+              {p.path}{p.used ? ' · занят банком' : ''}{p.printer && !p.used ? ' · принтер' : ''}
+            </option>
+          ))}
         </select>
         <button
           type="button"
@@ -190,6 +205,8 @@ export function PrinterTile({
             Если на бумаге всё равно непонятные символы — даже вместо цифр, — не совпадает скорость:
             попробуйте 19200 или 115200 (скорость своей модели видно на самотесте — включите принтер
             с зажатой кнопкой FEED). Строки переносятся не там — подберите ширину по линейке на пробной странице.
+            Порт принтера программа не опрашивает как плату и не подключает его кнопкой «Найти и подключить все»:
+            иначе кадры опроса BMS (dd a5 03 00 ff fd 77) печатались бы иероглифами.
           </p>
           <p className="muted tiny">
             Подключение: GND принтера к GND адаптера, TX принтера к RX адаптера, RX принтера к TX адаптера.

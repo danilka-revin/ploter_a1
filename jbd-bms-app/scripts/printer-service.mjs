@@ -22,8 +22,16 @@ const DEFAULTS = {
 };
 
 export class PrinterService {
-  constructor({ log = () => {} } = {}) {
+  /**
+   * @param {{log?:(m:string)=>void, isPortBusy?:(path:string)=>boolean}} [opts]
+   *   isPortBusy — проверка «порт занят платой (банком)». Если порт принтера
+   *   одновременно опрашивается как BMS, в него каждую секунду уходят кадры
+   *   dd a5 03 00 ff fd 77 — принтер печатает их как иероглифы и «кракозябры»
+   *   вместо чека. Печать на такой порт запрещена (см. _ensure).
+   */
+  constructor({ log = () => {}, isPortBusy = () => false } = {}) {
     this.log = log;
+    this.isPortBusy = isPortBusy;
     this.config = { ...DEFAULTS };
     this.printer = null;
     this.lastError = '';
@@ -37,6 +45,8 @@ export class PrinterService {
       baudRate: this.config.baudRate,
       width: this.config.width,
       language: 'en',
+      // порт отдан принтеру, но на нём висит плата: опрос печатается вместо чека
+      busy: this.isPortBusy(this.config.path),
       open: Boolean(this.printer?.isOpen),
       lastError: this.lastError,
       lastPrintAt: this.lastPrintAt,
@@ -73,6 +83,11 @@ export class PrinterService {
 
   _ensure() {
     if (!this.config.path) throw svcError(400, 'NO_PRINTER', 'Порт принтера не выбран.');
+    if (this.isPortBusy(this.config.path)) {
+      throw svcError(409, 'PORT_BUSY',
+        `Порт ${this.config.path} занят платой (банком): опрос BMS печатается на принтере и мешает чеку. `
+        + 'Отключите этот банк или выберите принтеру другой порт.');
+    }
     if (!this.printer || this.printer.path !== this.config.path || this.printer.baudRate !== this.config.baudRate) {
       this.printer = new ReceiptPrinter({
         path: this.config.path,

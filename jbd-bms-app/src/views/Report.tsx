@@ -483,9 +483,13 @@ export function ConnectTile({
         <select value={selected} onChange={(e) => onSelect(e.target.value)} disabled={scanning}>
           {!ports.some((p) => p.path === selected) && selected !== 'demo' && <option value={selected}>{selected}</option>}
           <option value="demo">Демо-режим (эмулятор платы)</option>
-          {ports.map((p) => <option key={p.path} value={p.path}>{p.path}{p.used ? ' · занят банком' : ''}</option>)}
+          {ports.map((p) => (
+            <option key={p.path} value={p.path}>
+              {p.path}{p.used ? ' · занят банком' : ''}{p.printer ? ' · принтер' : ''}
+            </option>
+          ))}
         </select>
-        <Btn tone="primary" onClick={onConnect} disabled={busy === 'connect' || !selected} title="Подключить выбранный порт">
+        <Btn tone="primary" onClick={onConnect} disabled={busy === 'connect' || !selected || ports.some((p) => p.path === selected && p.printer)} title="Подключить выбранный порт">
           {busy === 'connect' ? 'Открываю порт…' : '+ Подключить'}
         </Btn>
       </div>
