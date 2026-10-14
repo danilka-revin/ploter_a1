@@ -1,41 +1,12 @@
-// Мини-принтер чеков по UART TTL (ESC/POS-совместимый).
-//
-// Большинство дешёвых TTL-термопринтеров с AliExpress (5–9 В, TTL UART,
-// 203 dpi, 58 мм бумага) понимают базовые команды ESC/POS и работают на
-// скорости 9600 8N1. У некоторых моделей скорость иная (19200 / 115200) —
-// она задаётся параметром baudRate.
-//
-// Чек печатается ТОЛЬКО 7-битным ASCII: английский текст, латиница, цифры.
-// Почему не кириллица: у таких принтеров по умолчанию часто включён китайский
-// шрифт (GB18030), и любой байт ≥ 0x80 (кириллица в CP866 и т. п.) печатается
-// иероглифами; номера кодовых страниц ESC t у разных производителей тоже не
-// совпадают. Символы 0x20–0x7E одинаково печатает любой ESC/POS-принтер.
-// Поэтому каждая строка проходит через toPrinterText(): кириллица — транслитом,
-// типографские знаки (° Δ · — « » № …) — ASCII-заменами, управляющие байты
-// вырезаются (чтобы строка из платы не стала командой принтера).
-//
-// ВАЖНО: порт принтера нельзя опрашивать как плату BMS. Кадр опроса выглядит как
-// dd a5 03 00 ff fd 77 — байты ≥ 0x80 принтер напечатает иероглифами, а сам порт
-// останется занятым, и чек не напечатается. Поэтому порт принтера исключён из
-// поиска плат (scanApi в server.mjs) и его нельзя подключить как банк.
-//
-// Модуль умеет:
-//   • открыть/закрыть порт;
-//   • напечатать текст с выравниванием (влево/центр/вправо), жирный и
-//     двойной размер (для заголовков);
-//   • строку «название … значение» во всю ширину (не влезает — значение
-//     переносится на следующую строку, прижатым вправо);
-//   • разделитель, пустые строки, штрих-код CODE128, прогон бумаги и отрез
-//     (если у модели нет ножа, команда отреза просто игнорируется);
-//   • показать чек обычным текстом (renderReceiptText) — для предпросмотра
-//     в интерфейсе и для тестов.
-//
-// Пример:
-//   import { ReceiptPrinter } from './printer.mjs';
-//   const p = new ReceiptPrinter({ path: '/dev/ttyUSB1', baudRate: 9600 });
-//   await p.open();
-//   await p.printLines(lines);
-//   await p.close();
+// UART-драйвер текстовых отчётов на основе AlexGyver/Printer:
+// https://github.com/AlexGyver/Printer/blob/f218472ce97d1789e15e9707345d5d9192245598/libraries/printer/printer.h
+// Перенос протокола в Node.js: Arduino/ESP и сторонняя прошивка не нужны.
+// begin(): FF, пауза 60 мс, ESC @; config(): ESC 7; font(): ESC !.
+// Нагрев 10/140/4 взят из WemosPrint. Выравнивание — пробелами,
+// подача — CR LF (Arduino Print.println), без команд ножа/штрих-кода.
+// Текст — ASCII: кириллица транслитом, управляющие байты удаляются.
+// Байты >= 0x80 — только служебные: wake FF и время нагрева 140.
+// Порт принтера должен быть исключён из опроса BMS (см. server.mjs).
 
 import { SerialPort } from 'serialport';
 
@@ -43,38 +14,20 @@ const DEFAULT_BAUD = 9600;
 const DEFAULT_WIDTH = 32;
 /** Задержка между командами: дешёвые принтеры медленно переваривают ESC-команды. */
 const CMD_DELAY_MS = 20;
-/** Сколько пустых строк подать после печати (вместо отреза, если его нет). */
+/** Сколько пустых строк подать после печати для ручного отрыва. */
 const FEED_LINES = 4;
 
-// ---------- ESC/POS байтовые константы ----------
+// ---------- команды из libraries/printer/printer.h ----------
 const ESC = 0x1b;
-const GS = 0x1d;
-const LF = 0x0a;
-
-// ESC @ — инициализация (сброс выравнивания, шрифта, жирности)
+const CMD_WAKE = Buffer.from([0xff]);
 const CMD_INIT = Buffer.from([ESC, 0x40]);
-// ESC R 0 — международный набор «США»: стандартные # $ @ [ \ ] ^ { | } ~
-const CMD_INTL_USA = Buffer.from([ESC, 0x52, 0x00]);
-// ESC t 0 — кодовая страница PC437. Байты ≥ 0x80 мы не шлём вовсе, команда —
-// только для предсказуемого состояния принтера.
+const CMD_CONFIG = Buffer.from([ESC, 0x37, 10, 140, 4]);
 const CMD_CODEPAGE_PC437 = Buffer.from([ESC, 0x74, 0x00]);
-// ESC a n — выравнивание: 0 влево, 1 центр, 2 вправо
-const CMD_ALIGN = (n) => Buffer.from([ESC, 0x61, n & 0x03]);
-// GS ! n — размер шрифта: 0x00 обычный, 0x10 двойная высота, 0x01 двойная ширина, 0x11 обе
-const CMD_SIZE = (n) => Buffer.from([GS, 0x21, n & 0xff]);
-// ESC E n — жирный: 0 выкл, 1 вкл
-const CMD_BOLD = (n) => Buffer.from([ESC, 0x45, n ? 1 : 0]);
-// GS V 66 n — подача к ножу и неполный отрез. Для принтеров без ножа
-// это просто подача бумаги — команда безопасно игнорируется.
-const CMD_CUT_PART = Buffer.from([GS, 0x56, 0x42, 0x00]);
-// ESC d n — подать n строк
-const feed = (n) => Buffer.from([ESC, 0x64, Math.max(0, Math.min(255, n))]);
-
-/** GS k 73 n {B data — штрих-код CODE128, набор B (печатный ASCII; «{» экранируется как «{{»). */
-function barcode128(text) {
-  const data = Buffer.from(`{B${text.replace(/\{/g, '{{')}`, 'ascii');
-  return Buffer.concat([Buffer.from([GS, 0x6b, 0x49, data.length]), data]);
-}
+const CMD_FONT = (mode) => Buffer.from([ESC, 0x21, mode]);
+const CRLF = Buffer.from([0x0d, 0x0a]);
+const FONT_EMPH = 1 << 3;
+const FONT_DOUBLE_H = 1 << 4;
+const FONT_DOUBLE_W = 1 << 5;
 
 // ---------- перевод любого текста в печатный ASCII ----------
 
@@ -147,7 +100,16 @@ const clampWidth = (w) => {
   return Number.isFinite(n) && n >= 16 ? Math.min(n, 64) : DEFAULT_WIDTH;
 };
 const isDoubleWidth = (size) => size === 'big' || size === 'wide';
-const sizeCode = (size) => (size === 'big' ? 0x11 : size === 'wide' ? 0x01 : size === 'tall' ? 0x10 : 0x00);
+const sizeCode = (size) => (size === 'big' ? FONT_DOUBLE_H | FONT_DOUBLE_W
+  : size === 'wide' ? FONT_DOUBLE_W : size === 'tall' ? FONT_DOUBLE_H : 0);
+
+// Пробел тоже удваивается при FONT_DOUBLE_W: выравниваем в колонках шрифта.
+function alignedText(text, align, size, width) {
+  const cols = isDoubleWidth(size) ? Math.floor(width / 2) : width;
+  const gap = Math.max(0, cols - text.length);
+  const pad = align === 1 ? Math.floor(gap / 2) : align === 2 ? gap : 0;
+  return ' '.repeat(pad) + text;
+}
 const alignCode = (a) => (a === 1 || a === 2 ? a : 0);
 
 /** Перенос строки по ширине: по пробелам, слишком длинные слова — жёстко. */
@@ -218,7 +180,8 @@ export function layoutReceipt(lines, width = DEFAULT_WIDTH) {
       case 'feed': ops.push({ op: 'feed', n: Math.max(1, Number(ln.n) || 1) }); break;
       case 'barcode': {
         const text = toPrinterText(ln.text).slice(0, 20);
-        if (text) ops.push({ op: 'barcode', text });
+        // В драйвере AlexGyver нет штрих-кодов: безопасный текстовый ярлык.
+        if (text) for (const part of splitLines(`[barcode ${text}]`, w)) ops.push(lineOp(part, { align: 1 }));
         break;
       }
       case 'cut': ops.push({ op: 'cut' }); break;
@@ -238,19 +201,14 @@ export function renderReceiptText(lines, width = DEFAULT_WIDTH) {
   const out = [];
   for (const op of layoutReceipt(lines, w)) {
     if (op.op === 'line') {
-      const wide = isDoubleWidth(op.size);
-      const cols = wide ? op.text.length * 2 : op.text.length;
-      const shown = wide ? Array.from(op.text, (c) => `${c} `).join('').trimEnd() : op.text;
-      const padLeft = op.align === 1 ? Math.floor((w - cols) / 2) : op.align === 2 ? w - cols : 0;
-      out.push((' '.repeat(Math.max(0, padLeft)) + shown).trimEnd());
-    } else if (op.op === 'barcode') {
-      const label = `[barcode ${op.text}]`;
-      out.push(' '.repeat(Math.max(0, Math.floor((w - label.length) / 2))) + label);
+      const text = alignedText(op.text, op.align, op.size, w);
+      const shown = isDoubleWidth(op.size) ? Array.from(text, (c) => `${c} `).join('') : text;
+      out.push(shown.trimEnd());
     } else if (op.op === 'feed') {
       for (let i = 0; i < op.n; i++) out.push('');
     }
   }
-  // хвостовые пустые строки (подача перед отрезом) в предпросмотре не нужны
+  // хвостовые пустые строки (подача для ручного отрыва) в предпросмотре не нужны
   while (out.length && !out[out.length - 1]) out.pop();
   return out;
 }
@@ -276,6 +234,7 @@ export class ReceiptPrinter {
     this.cmdDelayMs = Math.max(0, Number(cmdDelayMs) || 0);
     this.port = null;
     this._busy = null;
+    this._style = { align: 0, bold: false, size: 0 };
   }
 
   get isOpen() { return Boolean(this.port?.isOpen); }
@@ -327,71 +286,73 @@ export class ReceiptPrinter {
   // ---------- примитивы ----------
 
   async init() {
+    await this.send(CMD_WAKE);
+    await sleep(60); // Printer.wake(): пауза не зависит от cmdDelayMs
     await this.send(CMD_INIT);
-    await this.send(Buffer.concat([CMD_INTL_USA, CMD_CODEPAGE_PC437]));
+    this._style = { align: 0, bold: false, size: 0 };
+    await this.send(CMD_CONFIG);
+    await this.send(CMD_CODEPAGE_PC437);
   }
-  async align(n) { await this.send(CMD_ALIGN(alignCode(n))); }   // 0=left 1=center 2=right
-  async bold(on) { await this.send(CMD_BOLD(on ? 1 : 0)); }
-  /** size: 0 обычный, 'big' двойной размер, 'wide' двойная ширина, 'tall' двойная высота */
-  async font(size = 0) { await this.send(CMD_SIZE(sizeCode(size))); }
 
-  /** Одна строка текста (любой текст приводится к печатному ASCII). */
+  // В printer.h нет ESC a: добавляем пробелы при отправке строки.
+  async align(n) { this._style.align = alignCode(n); }
+  async bold(on) { await this.font(this._style.size, Boolean(on)); }
+  /** ESC ! объединяет жирность и размер в одной битовой маске. */
+  async font(size = 0, bold = this._style.bold) {
+    const mode = sizeCode(size) | (bold ? FONT_EMPH : 0);
+    const prev = sizeCode(this._style.size) | (this._style.bold ? FONT_EMPH : 0);
+    if (mode !== prev) await this.send(CMD_FONT(mode));
+    this._style.size = size;
+    this._style.bold = bold;
+  }
+
+  /** Arduino Print.println(): ASCII-текст и CR LF. */
   async writeLine(text) {
-    await this.send(Buffer.concat([asciiBytes(text), Buffer.from([LF])]));
+    const line = alignedText(toPrinterText(text), this._style.align, this._style.size, this.width);
+    await this.send(Buffer.concat([asciiBytes(line), CRLF]));
   }
 
   async divider(ch = '-') {
     await this.writeLine((toPrinterText(ch).trim()[0] || '-').repeat(this.width));
   }
 
-  async blank(n = 1) {
-    for (let i = 0; i < n; i++) await this.writeLine('');
-  }
+  async blank(n = 1) { await this.feed(n); }
 
-  async cut() {
-    await this.feed(FEED_LINES);
-    // команда отреза может не поддерживаться — отправляем, не ругаемся, если не сработает
-    try { await this.send(CMD_CUT_PART); } catch { /* игнорируем */ }
-    await sleep(Math.min(120, this.cmdDelayMs * 6));
-  }
+  /** Совместимость со старым { t: 'cut' }: только подача, ножа в printer.h нет. */
+  async cut() { await this.feed(FEED_LINES); }
 
-  async feed(n) { await this.send(feed(n)); }
+  async feed(n) {
+    const count = Math.max(0, Math.min(255, Math.floor(Number(n) || 0)));
+    for (let i = 0; i < count; i++) await this.send(CRLF);
+  }
 
   /**
-   * Печатает чек: массив команд (см. layoutReceipt). В конце — подача и отрез,
-   * если чек сам не закончился командой { t: 'cut' }.
+   * Печатает чек: массив команд (см. layoutReceipt). В конце — подача бумаги,
+   * если чек сам не закончился командой feed/cut.
    */
   async printLines(lines) {
     const ops = layoutReceipt(lines, this.width);
     const run = async () => {
       if (!this.isOpen) await this.open();
       await this.init();
-      // после ESC @ принтер в состоянии по умолчанию; форматирование шлём только при смене
-      const cur = { align: 0, bold: false, size: 0 };
       const style = async (align, bold, size) => {
-        if (align !== cur.align) { await this.align(align); cur.align = align; }
-        if (bold !== cur.bold) { await this.bold(bold); cur.bold = bold; }
-        if (sizeCode(size) !== sizeCode(cur.size)) { await this.font(size); cur.size = size; }
+        await this.align(align);
+        await this.font(size, bold);
       };
       for (const op of ops) {
         if (op.op === 'line') {
           await style(op.align, op.bold, op.size);
           await this.writeLine(op.text);
         } else if (op.op === 'feed') {
+          await style(0, false, 0);
           await this.feed(op.n);
-        } else if (op.op === 'barcode') {
-          try {
-            await style(1, false, 0);
-            await this.send(barcode128(op.text));
-            await this.feed(2);
-          } catch { /* нет штрих-кода — не критично */ }
         } else if (op.op === 'cut') {
           await style(0, false, 0);
           await this.cut();
         }
       }
       await style(0, false, 0);
-      if (ops[ops.length - 1]?.op !== 'cut') await this.cut();
+      if (!['cut', 'feed'].includes(ops[ops.length - 1]?.op)) await this.feed(FEED_LINES);
     };
     // сериализуем вызовы, чтобы медленный принтер не потерял байты
     const busy = (this._busy || Promise.resolve()).then(run);
