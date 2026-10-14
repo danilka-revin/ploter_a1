@@ -7,6 +7,12 @@
 // Текст — ASCII: кириллица транслитом, управляющие байты удаляются.
 // Байты >= 0x80 — только служебные: wake FF и время нагрева 140.
 // Порт принтера должен быть исключён из опроса BMS (см. server.mjs).
+//
+// Если на бумаге мусор вместо букв и цифр, дело не в тексте, а в линии:
+// чаще всего не совпала скорость UART (у 58-мм модулей бывает 9600 и 19200).
+// Поэтому драйвер умеет менять скорость на лету (setLine) и спрашивать
+// состояние принтера (queryStatus) — по ответу видно, на какой скорости
+// принтер нас понимает.
 
 import { SerialPort } from 'serialport';
 
@@ -25,9 +31,45 @@ const CMD_CONFIG = Buffer.from([ESC, 0x37, 10, 140, 4]);
 const CMD_CODEPAGE_PC437 = Buffer.from([ESC, 0x74, 0x00]);
 const CMD_FONT = (mode) => Buffer.from([ESC, 0x21, mode]);
 const CRLF = Buffer.from([0x0d, 0x0a]);
+
 const FONT_EMPH = 1 << 3;
 const FONT_DOUBLE_H = 1 << 4;
 const FONT_DOUBLE_W = 1 << 5;
+
+/**
+ * Запросы состояния: принтер отвечает одним байтом только на «своей» скорости.
+ * ESC v 0 — новые прошивки QR701 (так делает Adafruit_Thermal), GS r 1 — старые,
+ * DLE EOT — real-time статус ESC/POS. Команда ничего не печатает.
+ */
+export const STATUS_QUERIES = [
+  { name: 'ESC v 0', bytes: Buffer.from([0x1b, 0x76, 0x00]) },
+  { name: 'GS r 1', bytes: Buffer.from([0x1d, 0x72, 0x01]) },
+  { name: 'DLE EOT 1', bytes: Buffer.from([0x10, 0x04, 0x01]) },
+  { name: 'DLE EOT 4', bytes: Buffer.from([0x10, 0x04, 0x04]) },
+];
+
+/**
+ * Байт состояния принтера: у статусов ESC/POS бит 0 всегда 0, бит 1 всегда 1
+ * (0x12 «бумага есть», 0x16 «нет бумаги», 0x5A — статус DLE EOT 1). Бит 2 —
+ * «нет бумаги», биты 3 и 5 — ошибка механики/крышка.
+ */
+export function describeStatusByte(byte) {
+  const b = Number(byte) & 0xff;
+  const plausible = (b & 0x02) !== 0 && (b & 0x01) === 0;
+  const paperOut = (b & 0x04) !== 0;
+  const error = (b & 0x28) !== 0;   // биты 3 и 5 — ошибка механики/крышка
+  return {
+    byte: b,
+    hex: `0x${b.toString(16).padStart(2, '0')}`,
+    plausible,
+    paperOut,
+    error,
+    text: !plausible ? 'ответ не похож на статус принтера (возможно, чужая скорость)'
+      : paperOut ? 'принтер ответил: НЕТ БУМАГИ'
+        : error ? 'принтер ответил: ошибка (проверьте бумагу и крышку)'
+          : 'принтер ответил: готов, бумага есть',
+  };
+}
 
 // ---------- перевод любого текста в печатный ASCII ----------
 
@@ -221,19 +263,24 @@ function sleep(ms) { return ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Pro
 
 export class ReceiptPrinter {
   /**
-   * @param {{path:string, baudRate?:number, width?:number, cmdDelayMs?:number, profile?:string, lineDelayMs?:number}} opts
+   * @param {{path:string, baudRate?:number, width?:number, cmdDelayMs?:number, profile?:string, lineDelayMs?:number, framing?:string}} opts
    *   path       — последовательный порт принтера (напр. /dev/ttyUSB1, COM4)
    *   baudRate   — скорость UART, по умолчанию 9600
    *   width      — ширина строки в символах (по умолчанию 32 для 58 мм бумаги)
    *   cmdDelayMs — пауза после каждой посылки (медленным принтерам), по умолчанию 20 мс
+   *   framing    — формат кадра: '8N1' (по умолчанию), '8E1', '7E1'
    */
-  constructor({ path, baudRate = DEFAULT_BAUD, width = DEFAULT_WIDTH, cmdDelayMs = CMD_DELAY_MS, profile = 'alexgyver', lineDelayMs = 0 } = {}) {
+  constructor({
+    path, baudRate = DEFAULT_BAUD, width = DEFAULT_WIDTH, cmdDelayMs = CMD_DELAY_MS,
+    profile = 'alexgyver', lineDelayMs = 0, framing = '8N1',
+  } = {}) {
     this.path = path;
     this.baudRate = Number(baudRate) || DEFAULT_BAUD;
     this.width = clampWidth(width);
     this.cmdDelayMs = Math.max(0, Number(cmdDelayMs) || 0);
     this.profile = PRINTER_PROFILES.includes(profile) ? profile : 'plain';
     this.lineDelayMs = Math.max(0, Number(lineDelayMs) || 0);
+    this.framing = PRINTER_FRAMINGS.includes(framing) ? framing : '8N1';
     this.port = null;
     this._portError = null;
     this._busy = null;
@@ -248,13 +295,11 @@ export class ReceiptPrinter {
       const port = new SerialPort({
         path: this.path,
         baudRate: this.baudRate,
-        dataBits: 8,
-        stopBits: 1,
-        parity: 'none',
         rtscts: false,
         xon: false,
         xoff: false,
         autoOpen: false,
+        ...framingOptions(this.framing),
       });
       port.on('error', (err) => { this._portError = err; });
       port.open((err) => {
@@ -264,6 +309,56 @@ export class ReceiptPrinter {
         resolve();
       });
     });
+  }
+
+  /**
+   * Сменить скорость и/или формат кадра, не закрывая порт.
+   * Нужно для автопоиска скорости: закрытие порта дёргает DTR и сбрасывает принтер.
+   * @returns {Promise<void>}
+   */
+  async setLine({ baudRate = this.baudRate, framing = this.framing } = {}) {
+    this.baudRate = Number(baudRate) || this.baudRate;
+    this.framing = PRINTER_FRAMINGS.includes(framing) ? framing : this.framing;
+    if (!this.port || !this.port.isOpen) return;
+    if (typeof this.port.update !== 'function') return;   // порт-заглушка в тестах
+    await new Promise((resolve, reject) => {
+      this.port.update({ baudRate: this.baudRate, ...framingOptions(this.framing) }, (e) => (e ? reject(e) : resolve()));
+    });
+    // линия только что шла на другой скорости — даём приёмнику успокоиться
+    await sleep(60);
+  }
+
+  /**
+   * Спросить у принтера состояние (команда ничего не печатает). Если ответ
+   * пришёл — скорость и формат кадра совпали с принтером: он нас понял.
+   * @param {{timeoutMs?:number, queries?:{name:string,bytes:Buffer}[]}} [opts]
+   * @returns {Promise<{bytes:Buffer, query:string, hex:string, status:object|null}>}
+   */
+  async queryStatus({ timeoutMs = 160, queries = STATUS_QUERIES } = {}) {
+    if (this._portError) throw this._portError;
+    if (!this.isOpen) throw new Error('Принтер не подключён.');
+    const got = [];
+    const onData = (chunk) => { for (const b of chunk) got.push(b); };
+    this.port.on('data', onData);
+    let asked = '';
+    try {
+      for (const q of queries) {
+        if (got.length) break;
+        asked = q.name;
+        await this.send(q.bytes);
+        await sleep(Math.max(0, Number(timeoutMs) || 0));
+      }
+    } finally {
+      if (typeof this.port.off === 'function') this.port.off('data', onData);
+      else if (typeof this.port.removeListener === 'function') this.port.removeListener('data', onData);
+    }
+    const bytes = Buffer.from(got);
+    return {
+      bytes,
+      query: asked,
+      hex: [...bytes].map((b) => b.toString(16).padStart(2, '0')).join(' '),
+      status: bytes.length ? describeStatusByte(bytes[0]) : null,
+    };
   }
 
   async close() {
@@ -373,8 +468,17 @@ export class ReceiptPrinter {
   }
 }
 
-/** Стандартные скорости для подбора в UI. */
-export const PRINTER_BAUDS = [9600, 19200, 38400, 57600, 115200];
+/** Скорости UART: подбираются в UI и перебираются при автопоиске. */
+export const PRINTER_BAUDS = [9600, 19200, 38400, 57600, 115200, 4800, 2400];
+
+/** Формат кадра: 8N1 у большинства модулей, 7E1/8E1 — у части китайских. */
+export const PRINTER_FRAMINGS = ['8N1', '8E1', '7E1'];
+
+export function framingOptions(framing) {
+  if (framing === '7E1') return { dataBits: 7, parity: 'even', stopBits: 1 };
+  if (framing === '8E1') return { dataBits: 8, parity: 'even', stopBits: 1 };
+  return { dataBits: 8, parity: 'none', stopBits: 1 };
+}
 
 /** Список «подозрительных» VID/PID, которые обычно являются USB-UART адаптерами,
  *  а не BMS-портами (только для подсказки — не жёстко). */

@@ -214,4 +214,14 @@ test('чековый принтер: предпросмотр чека на ан
   const noPort = await post('/api/printer/print', { id });
   assert.equal(noPort.status, 400);
   assert.equal(noPort.data.error, 'NO_PRINTER');
+
+  // без выбранного порта перебор скоростей и запрос состояния тоже не начинаются
+  for (const path of ['/api/printer/query', '/api/printer/detect', '/api/printer/sweep']) {
+    const r = await post(path, {});
+    assert.equal(r.status, 400, `${path} без порта`);
+    assert.equal(r.data.error, 'NO_PRINTER', path);
+  }
+  const cfg = await post('/api/printer/config', { framing: '8N9' });
+  assert.equal(cfg.status, 400);
+  assert.equal(cfg.data.error, 'BAD_FRAMING');
 });

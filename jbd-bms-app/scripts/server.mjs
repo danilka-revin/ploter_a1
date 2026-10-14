@@ -33,6 +33,9 @@
 //   POST /api/poll {ms}                    — задать период опроса
 //   GET  /api/printer                     — статус TTL-чекового принтера
 //   POST /api/printer/config              — настройки принтера (порт, скорость, ширина строки)
+//   POST /api/printer/query               — спросить у принтера состояние (нет бумаги, ошибка)
+//   POST /api/printer/detect              — автопоиск скорости UART по ответу принтера
+//   POST /api/printer/sweep               — печать блоков на всех скоростях (ищем читаемый)
 //   POST /api/printer/test                — пробная страница
 //   POST /api/printer/print {id}          — печать сводки по банку (id=all — по парку)
 //   GET  /api/printer/preview?id=         — тот же чек текстом, без печати (id=all — парк, id=test — пробная)
@@ -443,6 +446,15 @@ async function handleApi(req, res, url) {
       }
     }
     return send(res, 200, { ...printer.configure(body), freedPort });
+  }
+  if (method === 'POST' && pathname === '/api/printer/query') {
+    return send(res, 200, await printer.queryPrinter());
+  }
+  if (method === 'POST' && pathname === '/api/printer/detect') {
+    return send(res, 200, await printer.detectBaud());
+  }
+  if (method === 'POST' && pathname === '/api/printer/sweep') {
+    return send(res, 200, await printer.sweepBauds());
   }
   if (method === 'POST' && pathname === '/api/printer/diagnostic') {
     return send(res, 200, await printer.diagnostic());
