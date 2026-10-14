@@ -25,7 +25,7 @@ const bank = {
   stats: { min: 3297, max: 3318, delta: 21, avg: 3314, minIndex: 2, maxIndex: 0, sum: 39758 },
   temperatures: [25.4, 26.1], chargeFetOn: true, dischargeFetOn: false, balancingCells: [3],
   faults: [{ key: 'covp', label: 'Перенапряжение ячейки' }, { key: 'dsgoc', label: 'Перегрузка по разряду' }], faultRaw: 0x201,
-  errors: null, hwVersion: 'HW 1.3', swVersion: 'SW 4.21-LFP', serial: '12 34 05 00 42', prodDate: '17.05.2024',
+  errors: { covp: 2, dsgoc: 1, sc: 0 }, hwVersion: 'HW 1.3', swVersion: 'SW 4.21-LFP', serial: '12 34 05 00 42', prodDate: '17.05.2024',
   firmwareVersion: 16, spark: [],
 };
 const offline = {
@@ -71,15 +71,44 @@ test('сводка по аккумулятору — на английском, 
     '61.80 / 100.00 Ah', 'Cycles', '127', '12S', 'Lowest cell', '#3  3.297 V', 'Highest cell', '#1  3.318 V',
     '21 mV', '#01 3318mV^', '#03 3297mV!b', '! min  ^ max  b balancing', 'TEMPERATURES', 'Sensor T1', '25.4 C',
     'Charge FET', 'Discharge FET', 'OFF', '1 cell', '2 ACTIVE', '! Cell overvoltage', '! Discharge overcurrent',
-    'Firmware', 'SW 4.21-LFP', 'Manufactured', '2024-05-17', 'ALL BATTERIES: 1/2 ONLINE', 'Printed by JBD BMS',
+    'ALL BATTERIES: 1/2 ONLINE', 'Printed by JBD BMS',
   ]) assert.ok(text.includes(s), `в чеке есть «${s}»:\n${text}`);
+  assert.match(text, /^Report {2,}medium$/m, 'без выбора печатается средний чек (настройка принтера)');
   assert.doesNotMatch(text, /39,71|n\/a V|undefined|NaN|null/, 'десятичная точка, без мусора');
   assert.match(text, /^Status {2,}online$/m, 'строка «название … значение» во всю ширину');
+});
+
+test('полный чек: каждая банка строкой, счётчики защит и паспорт платы', () => {
+  for (const width of WIDTHS) {
+    assertPrintable(renderReceiptText(buildBankReceipt(bank, fleet, width, 'full'), width), width, `полный @${width}`);
+  }
+  const full = renderReceiptText(buildBankReceipt(bank, fleet, 32, 'full'), 32).join('\n');
+  for (const s of [
+    'BOARD', 'Hardware', 'HW 1.3', 'Firmware', 'SW 4.21-LFP', 'Serial no.', '12 34 05 00 42', 'Manufactured', '2024-05-17',
+    'PROTECTION COUNTERS', 'CELL DETAIL', 'deviation from average', '#01  3.318 V  +4 mV', '#03  3.297 V  -17 mV  b',
+    'Fault register', '0x0201',
+    'ALL BATTERIES: 1/2 ONLINE', '! Cell overvoltage',
+  ]) assert.ok(full.includes(s), `в полном чеке есть «${s}»:\n${full}`);
+  assert.match(full, /^Cell overvoltage {2,}2$/m, 'счётчик перенапряжения — 2 срабатывания');
+  assert.match(full, /^Discharge overcurrent {2,}1$/m, 'счётчик перегрузки разряда — 1');
+  assert.doesNotMatch(full, /^Short circuit {2,}\d+$/m, 'нулевые счётчики защит не печатаются');
+
+  const medium = renderReceiptText(buildBankReceipt(bank, fleet, 32, 'medium'), 32).join('\n');
+  assert.doesNotMatch(medium, /BOARD|Firmware|PROTECTION COUNTERS|CELL DETAIL/, 'средний чек короче полного');
+  const short = renderReceiptText(buildBankReceipt(bank, fleet, 32, 'short'), 32).join('\n');
+  assert.doesNotMatch(short, /MAIN READINGS|CELLS|TEMPERATURES|SWITCHES|#01 3318mV/, 'короткий чек — только главное');
+  assert.match(short, /^Voltage {2,}39\.71 V$/m, 'главные числа в коротком чеке');
+  assert.match(short, /^Protections {2,}2 ACTIVE$/m, 'счётчик защит в коротком чеке');
+  const sizes = ['short', 'medium', 'full'].map((lv) => renderReceiptText(buildBankReceipt(bank, fleet, 32, lv), 32).length);
+  assert.ok(sizes[0] < sizes[1] && sizes[1] < sizes[2], `короткий < средний < полный: ${sizes.join(' < ')}`);
 });
 
 test('сводка без связи с платой: «OFFLINE» и «n/a» вместо чисел', () => {
   const text = renderReceiptText(buildBankReceipt(offline, null, 32), 32);
   assertPrintable(text, 32, 'офлайн');
+  for (const level of ['short', 'medium', 'full']) {
+    assertPrintable(renderReceiptText(buildBankReceipt(offline, null, 32, level), 32), 32, `офлайн · ${level}`);
+  }
   const all = text.join('\n');
   assert.match(all, /DEMO B/);
   assert.match(all, /^Status {2,}OFFLINE$/m);
@@ -91,7 +120,11 @@ test('сводка без связи с платой: «OFFLINE» и «n/a» в�
 });
 
 test('сводка по парку — на английском, ASCII, по ширине бумаги', () => {
-  for (const width of WIDTHS) assertPrintable(renderReceiptText(buildFleetReceipt([bank, offline], fleet, width), width), width, `парк @${width}`);
+  for (const width of WIDTHS) {
+    for (const level of ['short', 'medium', 'full']) {
+      assertPrintable(renderReceiptText(buildFleetReceipt([bank, offline], fleet, width, level), width), width, `парк @${width} · ${level}`);
+    }
+  }
   const text = renderReceiptText(buildFleetReceipt([bank, offline], fleet, 32), 32).join('\n');
   for (const s of [
     'A L L   B A T T E R I E S', 'Summary report', 'Boards', 'Offline', 'Average voltage', 'Total current',

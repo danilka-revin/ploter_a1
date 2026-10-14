@@ -135,6 +135,17 @@ test('плитки панели рендерятся: акцент на банк
   assert.doesNotMatch(connect, /доступных регистров/, 'каталог сырых регистров не показывается');
   assert.match(connect, /чек на английском/, 'видно, что чек печатается на английском');
   assert.match(connect, /предпросмотр чека/, 'есть предпросмотр чека без печати');
+  assert.match(connect, /вид чека/, 'есть выбор вида чека');
+  for (const level of ['короткий', 'средний', 'полный']) {
+    assert.match(connect, new RegExp(`>${level}<`), `в выборе вида чека есть «${level}»`);
+  }
+  assert.match(connect, /Печать: средний/, 'по умолчанию печатается средний чек');
+  assert.match(connect, /язык чека/, 'есть выбор языка чека');
+  for (const lang of ['английский', 'русский']) {
+    assert.match(connect, new RegExp(`>${lang}<`), `в выборе языка есть «${lang}»`);
+  }
+  assert.match(connect, /чек на английском · вид/, 'по умолчанию чек печатается на английском');
+  assert.doesNotMatch(connect, /кодировка/, 'выбор кодировки показывается только для русского чека');
   assert.doesNotMatch(connect, /только латиница|CP866/, 'настройки кириллицы для принтера убраны');
   const jr = m.renderJournal();
   assert.match(jr, /Записано 2 пар\./);

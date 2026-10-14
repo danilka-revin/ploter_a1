@@ -4,8 +4,10 @@
 // Только профиль alexgyver: begin(): FF, пауза 60 мс, ESC @; config(): ESC 7; font(): ESC !.
 // Нагрев 10/140/4 взят из WemosPrint. Выравнивание — пробелами,
 // подача — CR LF (Arduino Print.println), без команд ножа/штрих-кода.
-// Текст — ASCII: кириллица транслитом, управляющие байты удаляются.
-// Байты >= 0x80 — только служебные: wake FF и время нагрева 140.
+// Язык чека выбирается: `en` — английский (кириллица транслитом, только ASCII-байты,
+// работает на любом принтере) и `ru` — русский (кириллица как есть в cp866 / cp1251 / utf8,
+// нужны русские буквы в шрифте принтера и подходящая кодовая страница ESC t).
+// В режиме `en` байты >= 0x80 — только служебные: wake FF и время нагрева 140.
 // Порт принтера должен быть исключён из опроса BMS (см. server.mjs).
 //
 // Если на бумаге мусор вместо букв и цифр, дело не в тексте, а в линии:
@@ -31,6 +33,8 @@ const CMD_CONFIG = Buffer.from([ESC, 0x37, 10, 140, 4]);
 const CMD_CODEPAGE_PC437 = Buffer.from([ESC, 0x74, 0x00]);
 const CMD_FONT = (mode) => Buffer.from([ESC, 0x21, mode]);
 const CRLF = Buffer.from([0x0d, 0x0a]);
+
+const CMD_CODEPAGE = (n) => Buffer.from([ESC, 0x74, n & 0xff]);
 
 const FONT_EMPH = 1 << 3;
 const FONT_DOUBLE_H = 1 << 4;
@@ -70,6 +74,41 @@ export function describeStatusByte(byte) {
           : 'принтер ответил: готов, бумага есть',
   };
 }
+
+// ---------- язык чека и кодировка кириллицы ----------
+
+/**
+ * Язык чека:
+ *   en — английский: кириллица транслитерируется, в принтер уходят только ASCII-байты.
+ *        Такой чек читается на любом принтере, поэтому это значение по умолчанию;
+ *   ru — русский: буквы печатаются как есть в выбранной кодировке (cp866, cp1251, utf8).
+ *        Русские буквы есть не во всех шрифтах дешёвых принтеров: если на бумаге
+ *        вместо слов мусор — верните английский.
+ */
+export const PRINTER_LANGUAGES = ['en', 'ru'];
+/** Кодировки кириллицы для русского чека. */
+export const PRINTER_CHARSETS = ['cp866', 'cp1251', 'utf8'];
+/** Номер страницы кодовой таблицы для ESC t n (ESC/POS): PC866 = 17, WPC1251 = 46. */
+export const CHARSET_CODEPAGE = { cp866: 17, cp1251: 46, utf8: null };
+
+/**
+ * Старшие половины кодовых страниц (байты 0x80–0xFF) — из стандартных таблиц
+ * IBM866 и Windows-1251. Из них собирается карта «символ → байт»; нулевой символ
+ * (неопределённый байт) и неразрывный пробел в карту не попадают.
+ */
+const CP866_HIGH = 'АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмноп░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀рстуфхцчшщъыьэюяЁёЄєЇїЎў°∙·√№¤■\u00a0';
+const CP1251_HIGH = 'ЂЃ‚ѓ„…†‡€‰Љ‹ЊЌЋЏђ‘’“”•–—\u0000™љ›њќћџ\u00a0ЎўЈ¤Ґ¦§Ё©Є«¬­®Ї°±Ііґµ¶·ё№є»јЅѕїАБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмнопрстуфхцчшщъыьэюя';
+
+function charsetMap(high) {
+  const map = new Map();
+  for (let i = 0; i < high.length; i++) {
+    const ch = high[i];
+    if (ch === '\u0000' || ch === '\u00a0' || map.has(ch)) continue;
+    map.set(ch, 0x80 + i);
+  }
+  return map;
+}
+const CHARSET_MAPS = { cp866: charsetMap(CP866_HIGH), cp1251: charsetMap(CP1251_HIGH) };
 
 // ---------- перевод любого текста в печатный ASCII ----------
 
@@ -130,9 +169,56 @@ export function toPrinterText(input) {
   return out;
 }
 
-/** Строка → байты для принтера (гарантированно < 0x80). */
+/** Строка → байты для принтера (гарантированно < 0x80) — английский чек. */
 function asciiBytes(text) {
   return Buffer.from(toPrinterText(text), 'ascii');
+}
+
+/**
+ * Убрать управляющие символы и служебные пробелы, оставив буквы любого языка.
+ * Нужно для русского чека: в принтер нельзя отправлять ESC/GS (0x1B, 0x1D) из данных.
+ */
+export function sanitizeText(input) {
+  let out = '';
+  for (const ch of Array.from(String(input ?? '').normalize('NFC'))) {
+    const code = ch.codePointAt(0);
+    if (ch === '\t') { out += ' '; continue; }
+    if (code < 0x20 || (code >= 0x7f && code < 0xa0)) continue;   // управляющие — выкидываем
+    if (code === 0xa0) { out += ' '; continue; }                    // неразрывный пробел — обычным
+    out += ch;
+  }
+  return out;
+}
+
+/**
+ * Конвертер текста под язык чека: `en` — транслит кириллицы в ASCII,
+ * `ru` — текст как есть (буквы, цифры, знаки; управляющие символы вырезаны).
+ */
+export function textConverter({ language = 'en' } = {}) {
+  return (text) => (language === 'ru' ? sanitizeText(text) : toPrinterText(text));
+}
+
+/**
+ * Строка → байты для принтера в выбранном языке и кодировке.
+ *   en   — только ASCII (0x20–0x7E), кириллица транслитом;
+ *   ru   — cp866 / cp1251 (своя таблица) или utf8;
+ *          символа нет в кодировке — печатается «?», а не мусор.
+ * @param {string} input
+ * @param {{language?:'en'|'ru', charset?:'cp866'|'cp1251'|'utf8'}} [opts]
+ * @returns {Buffer}
+ */
+export function encodePrinterText(input, { language = 'en', charset = 'cp866' } = {}) {
+  const text = textConverter({ language })(input);
+  if (language !== 'ru') return Buffer.from(text, 'ascii');
+  if (charset === 'utf8') return Buffer.from(text, 'utf8');
+  const map = CHARSET_MAPS[charset] ?? CHARSET_MAPS.cp866;
+  const bytes = [];
+  for (const ch of text) {
+    const code = ch.codePointAt(0);
+    if (code < 0x80) { bytes.push(code); continue; }
+    bytes.push(map.get(ch) ?? 0x3f);
+  }
+  return Buffer.from(bytes);
 }
 
 // ---------- раскладка чека по строкам ----------
@@ -181,12 +267,13 @@ const lineOp = (text, { align = 0, bold = false, size = 0 } = {}) => ({ op: 'lin
  * превращаются в плоский список операций печати. Каждая строка — уже ASCII
  * и не длиннее ширины бумаги (для двойной ширины — половины).
  */
-export function layoutReceipt(lines, width = DEFAULT_WIDTH) {
+export function layoutReceipt(lines, width = DEFAULT_WIDTH, { language = 'en' } = {}) {
   const w = clampWidth(width);
+  const conv = textConverter({ language });
   const ops = [];
   for (const ln of lines ?? []) {
     if (typeof ln === 'string') {
-      for (const part of splitLines(toPrinterText(ln), w)) ops.push(lineOp(part));
+      for (const part of splitLines(conv(ln), w)) ops.push(lineOp(part));
       continue;
     }
     switch (ln?.t) {
@@ -194,14 +281,14 @@ export function layoutReceipt(lines, width = DEFAULT_WIDTH) {
         const size = ln.size || 0;
         const align = alignCode(ln.align);
         const cols = isDoubleWidth(size) ? Math.max(1, Math.floor(w / 2)) : w;
-        for (const part of splitLines(toPrinterText(ln.text), cols)) {
+        for (const part of splitLines(conv(ln.text), cols)) {
           ops.push(lineOp(align ? part.trim() : part, { align, bold: Boolean(ln.bold), size }));
         }
         break;
       }
       case 'row': {
-        const k = toPrinterText(ln.left).trim();
-        const v = toPrinterText(ln.right).trim();
+        const k = conv(ln.left).trim();
+        const v = conv(ln.right).trim();
         const style = { bold: Boolean(ln.bold) };
         if (k.length + 1 + v.length <= w) {
           ops.push(lineOp(k + ' '.repeat(w - k.length - v.length) + v, style));
@@ -212,7 +299,8 @@ export function layoutReceipt(lines, width = DEFAULT_WIDTH) {
         break;
       }
       case 'divider': {
-        const ch = toPrinterText(ln.ch || '-').trim()[0] || '-';
+        // берём первый символ, который реально есть в шрифте: «─» → «-» для английского и utf8
+        const ch = (language === 'ru' ? sanitizeText(ln.ch || '-') : toPrinterText(ln.ch || '-')).trim()[0] || '-';
         ops.push(lineOp(ch.repeat(w)));
         break;
       }
@@ -221,7 +309,7 @@ export function layoutReceipt(lines, width = DEFAULT_WIDTH) {
         break;
       case 'feed': ops.push({ op: 'feed', n: Math.max(1, Number(ln.n) || 1) }); break;
       case 'barcode': {
-        const text = toPrinterText(ln.text).slice(0, 20);
+        const text = conv(ln.text).slice(0, 20);
         // В драйвере AlexGyver нет штрих-кодов: безопасный текстовый ярлык.
         if (text) for (const part of splitLines(`[barcode ${text}]`, w)) ops.push(lineOp(part, { align: 1 }));
         break;
@@ -238,10 +326,10 @@ export function layoutReceipt(lines, width = DEFAULT_WIDTH) {
  * ширина показана буквами через пробел (каждая занимает две колонки).
  * Нужен для предпросмотра в интерфейсе и для тестов.
  */
-export function renderReceiptText(lines, width = DEFAULT_WIDTH) {
+export function renderReceiptText(lines, width = DEFAULT_WIDTH, { language = 'en' } = {}) {
   const w = clampWidth(width);
   const out = [];
-  for (const op of layoutReceipt(lines, w)) {
+  for (const op of layoutReceipt(lines, w, { language })) {
     if (op.op === 'line') {
       const text = alignedText(op.text, op.align, op.size, w);
       const shown = isDoubleWidth(op.size) ? Array.from(text, (c) => `${c} `).join('') : text;
@@ -272,7 +360,7 @@ export class ReceiptPrinter {
    */
   constructor({
     path, baudRate = DEFAULT_BAUD, width = DEFAULT_WIDTH, cmdDelayMs = CMD_DELAY_MS,
-    profile = 'alexgyver', lineDelayMs = 0, framing = '8N1',
+    profile = 'alexgyver', lineDelayMs = 0, framing = '8N1', language = 'en', charset = 'cp866',
   } = {}) {
     this.path = path;
     this.baudRate = Number(baudRate) || DEFAULT_BAUD;
@@ -281,6 +369,9 @@ export class ReceiptPrinter {
     this.profile = PRINTER_PROFILES.includes(profile) ? profile : 'plain';
     this.lineDelayMs = Math.max(0, Number(lineDelayMs) || 0);
     this.framing = PRINTER_FRAMINGS.includes(framing) ? framing : '8N1';
+    // язык чека: en — транслит ASCII, ru — кириллица в выбранной кодировке
+    this.language = PRINTER_LANGUAGES.includes(language) ? language : 'en';
+    this.charset = PRINTER_CHARSETS.includes(charset) ? charset : 'cp866';
     this.port = null;
     this._portError = null;
     this._busy = null;
@@ -396,7 +487,24 @@ export class ReceiptPrinter {
     await this.send(CMD_INIT);
     this._style = { align: 0, bold: false, size: 0 };
     if (this.profile === 'alexgyver') await this.send(CMD_CONFIG);
-    await this.send(CMD_CODEPAGE_PC437);
+    // страница кодовой таблицы: PC437 для английского, PC866 / WPC1251 — для русского.
+    // В простом тексте и для utf8 команды нет — страница остаётся как настроена в принтере.
+    const codepage = this.codepageCommand();
+    if (codepage) await this.send(codepage);
+  }
+
+  /**
+   * ESC t n для кодировки русского чека. В profile=plain команды не отправляются
+   * вовсе; для utf8 номер страницы не задан — страница остаётся как была.
+   * @returns {Buffer|null}
+   */
+  codepageCommand() {
+    if (this.profile === 'plain') return null;
+    if (this.language === 'ru') {
+      const page = CHARSET_CODEPAGE[this.charset];
+      return page == null ? null : CMD_CODEPAGE(page);
+    }
+    return CMD_CODEPAGE_PC437;
   }
 
   // В printer.h нет ESC a: добавляем пробелы при отправке строки.
@@ -411,16 +519,18 @@ export class ReceiptPrinter {
     this._style.bold = bold;
   }
 
-  /** Arduino Print.println(): ASCII-текст и CR LF. */
+  /** Arduino Print.println(): текст выбранного языка (ASCII или кириллица) и CR LF. */
   async writeLine(text) {
-    const line = alignedText(toPrinterText(text), this._style.align, this._style.size, this.width);
-    await this.send(Buffer.concat([asciiBytes(line), CRLF]));
+    const shown = textConverter({ language: this.language })(text);
+    const line = alignedText(shown, this._style.align, this._style.size, this.width);
+    await this.send(Buffer.concat([encodePrinterText(line, { language: this.language, charset: this.charset }), CRLF]));
     // drain() ждёт UART, а не механизм печати. Без DTR выдерживаем паузу.
     await sleep(this.lineDelayMs * (this._style.size === 'big' || this._style.size === 'tall' ? 2 : 1));
   }
 
   async divider(ch = '-') {
-    await this.writeLine((toPrinterText(ch).trim()[0] || '-').repeat(this.width));
+    const one = (this.language === 'ru' ? sanitizeText(ch) : toPrinterText(ch)).trim()[0] || '-';
+    await this.writeLine(one.repeat(this.width));
   }
 
   async blank(n = 1) { await this.feed(n); }
@@ -438,7 +548,7 @@ export class ReceiptPrinter {
    * если чек сам не закончился командой feed/cut.
    */
   async printLines(lines) {
-    const ops = layoutReceipt(this.profile === 'plain' ? plainReceipt(lines) : lines, this.width);
+    const ops = layoutReceipt(this.profile === 'plain' ? plainReceipt(lines) : lines, this.width, { language: this.language });
     const run = async () => {
       if (!this.isOpen) await this.open();
       await this.init();
@@ -492,5 +602,10 @@ export function isPrinterLikePort(p) {
 export const PRINTER_PROFILES = ['plain', 'escpos', 'alexgyver'];
 
 export function plainReceipt(lines) {
-  return (lines ?? []).map((ln) => ln?.t === 'text' ? { ...ln, size: 0, bold: false } : ln);
+  return (lines ?? []).map((ln) => {
+    if (ln?.t === 'text') return { ...ln, size: 0, bold: false };
+    // «─» (U+2500) в простом режиме и в английском чеке остаётся без замены — меняем на «-»
+    if (ln?.t === 'divider' && ln.ch === '\u2500') return { ...ln, ch: '-' };
+    return ln;
+  });
 }

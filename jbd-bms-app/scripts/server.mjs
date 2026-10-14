@@ -32,13 +32,19 @@
 //   GET  /api/catalog                     — описания регистров, настроек и команд
 //   POST /api/poll {ms}                    — задать период опроса
 //   GET  /api/printer                     — статус TTL-чекового принтера
-//   POST /api/printer/config              — настройки принтера (порт, скорость, ширина строки)
+//   POST /api/printer/config              — настройки принтера (порт, скорость, ширина, вид чека, язык)
 //   POST /api/printer/query               — спросить у принтера состояние (нет бумаги, ошибка)
 //   POST /api/printer/detect              — автопоиск скорости UART по ответу принтера
 //   POST /api/printer/sweep               — печать блоков на всех скоростях (ищем читаемый)
 //   POST /api/printer/test                — пробная страница
-//   POST /api/printer/print {id}          — печать сводки по банку (id=all — по парку)
-//   GET  /api/printer/preview?id=         — тот же чек текстом, без печати (id=all — парк, id=test — пробная)
+//   POST /api/printer/print {id, level, language, charset}
+//                                         — печать сводки по банку (id=all — по парку);
+//                                           level: short (короткая) | medium (средняя) | full (полная);
+//                                           language: en (английский, ASCII) | ru (русский, кириллица);
+//                                           charset: cp866 | cp1251 | utf8 (для русского чека);
+//                                           без level и language берутся настройки принтера
+//   GET  /api/printer/preview?id=&level=&language=
+//                                         — тот же чек текстом, без печати (id=all — парк, id=test — пробная)
 //   Чеки на английском, ASCII; скорость и профиль должны соответствовать модели.
 //
 // Старые одиночные адреса сохранены: /api/connect, /api/disconnect, /api/state,
@@ -66,7 +72,7 @@ import { scanBmsPorts } from './port-scan.mjs';
 import { inspectFirmwareFile, flashFirmware, FirmwareError } from './firmware.mjs';
 import { createUpdater, RESTART_EXIT_CODE } from './updater.mjs';
 import { parseIntelHex } from './intel-hex.mjs';
-import { PrinterService } from './printer-service.mjs';
+import { PrinterService, REPORT_LEVELS, PRINTER_LANGUAGES, PRINTER_CHARSETS } from './printer-service.mjs';
 
 const APP_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const DIST = join(APP_DIR, 'dist');
@@ -206,6 +212,58 @@ function checkNotPrinterPort(path) {
 function secondsOf(url) {
   const raw = Number(url.searchParams.get('seconds') || url.searchParams.get('window') || 600);
   return Math.max(15, Math.min(7200, Number.isFinite(raw) && raw > 0 ? raw : 600));
+}
+
+/**
+ * Язык чека из запроса: английский (en) или русский (ru).
+ * Без параметра возвращает null — тогда берётся язык из настроек принтера.
+ */
+function printerLanguage(raw) {
+  const language = String(raw ?? '').trim().toLowerCase();
+  if (!language) return null;
+  if (!PRINTER_LANGUAGES.includes(language)) {
+    throw httpError(400, 'BAD_LANGUAGE', `Неизвестный язык чека «${raw}»: английский (en) или русский (ru).`);
+  }
+  return language;
+}
+
+/** Кодировка кириллицы из запроса: cp866, cp1251 или utf8. */
+function printerCharset(raw) {
+  const charset = String(raw ?? '').trim().toLowerCase();
+  if (!charset) return null;
+  if (!PRINTER_CHARSETS.includes(charset)) {
+    throw httpError(400, 'BAD_CHARSET', `Неизвестная кодировка чека «${raw}»: cp866, cp1251 или utf8.`);
+  }
+  return charset;
+}
+
+/**
+ * Вид чека из запроса: короткий (short), средний (medium) или полный (full).
+ * Без параметра возвращает null — тогда печатается вид из настроек принтера.
+ */
+function printerLevel(raw) {
+  const level = String(raw ?? '').trim().toLowerCase();
+  if (!level) return null;
+  if (!REPORT_LEVELS.includes(level)) {
+    throw httpError(400, 'BAD_LEVEL',
+      `Неизвестный вид чека «${raw}»: короткий (short), средний (medium) или полный (full).`);
+  }
+  return level;
+}
+
+/**
+ * Предпросмотр чека для браузера: строки, байты для UART (массив чисел) и размер.
+ * Байты нужны, чтобы видеть, что именно уйдёт в принтер в русском режиме.
+ */
+function previewJson(preview) {
+  const { bytes, raw, ...rest } = preview;
+  return {
+    ...rest,
+    bytes: [...bytes],
+    byteLength: bytes.length,
+    // весь чек можно отправить как есть, без команд: true — чистый ASCII
+    ascii: bytes.every((b) => b === 0x0d || b === 0x0a || (b >= 0x20 && b < 0x7f)),
+  };
 }
 
 async function handleApi(req, res, url) {
@@ -465,25 +523,33 @@ async function handleApi(req, res, url) {
   if (method === 'POST' && pathname === '/api/printer/print') {
     const body = await readJson(req);
     const target = body.id === 'all' || body.all ? null : (body.id || null);
+    // вид чека и язык: без них печатается то, что выбрано в настройках принтера
+    const level = printerLevel(body.level ?? body.reportLevel);
+    const opts = {
+      language: printerLanguage(body.language ?? body.lang),
+      charset: printerCharset(body.charset),
+    };
     if (target === null) {
       const rows = banks.list().map((b) => banks.row(b));
       if (!rows.length) throw httpError(409, 'NO_BANK', 'Нет подключённых аккумуляторов.');
-      return send(res, 200, await printer.printFleet(rows, banks.fleet()));
+      return send(res, 200, await printer.printFleet(rows, banks.fleet(), level, opts));
     }
     const bank = banks.get(target);
     // обновляем данные, если банк на связи; не падаем, если опрос не удался — печатаем то, что есть
     if (bank.connected) await banks.pollOne(bank).catch(() => {});
-    return send(res, 200, await printer.printBank(banks.row(bank), banks.fleet()));
+    return send(res, 200, await printer.printBank(banks.row(bank), banks.fleet(), level, opts));
   }
   if (method === 'GET' && pathname === '/api/printer/preview') {
     const id = q.get('id') || 'all';
-    if (id === 'test') return send(res, 200, printer.previewTest());
+    if (id === 'test') return send(res, 200, previewJson(printer.previewTest()));
+    const level = printerLevel(q.get('level') ?? q.get('reportLevel'));
+    const language = printerLanguage(q.get('language') ?? q.get('lang'));
     if (id === 'all') {
       const rows = banks.list().map((b) => banks.row(b));
       if (!rows.length) throw httpError(409, 'NO_BANK', 'Нет подключённых аккумуляторов.');
-      return send(res, 200, printer.previewFleet(rows, banks.fleet()));
+      return send(res, 200, previewJson(printer.previewFleet(rows, banks.fleet(), level, language)));
     }
-    return send(res, 200, printer.previewBank(banks.row(banks.get(id)), banks.fleet()));
+    return send(res, 200, previewJson(printer.previewBank(banks.row(banks.get(id)), banks.fleet(), level, language)));
   }
 
   // ----- прошивка -----

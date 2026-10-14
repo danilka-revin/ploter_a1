@@ -175,7 +175,7 @@ export default function App() {
           <Btn small onClick={cockpit.exportJson} title="Полный отчёт в JSON">JSON</Btn>
           <Btn small
             onClick={() => cockpit.printSummary(cockpit.focusBank?.id ? cockpit.focusBank.id : 'all')}
-            title="Распечатать сводку по аккумулятору на TTL-чековом принтере — чек на английском (Ctrl+P)"
+            title="Распечатать сводку по аккумулятору на TTL-чековом принтере — чек на английском. Вид чека (короткий, средний, полный) выбирается в блоке принтера (Ctrl+P)"
           >🖶 Печать</Btn>
           <button className="ic" onClick={() => setDensity(density === 'compact' ? 'roomy' : 'compact')} title="Плотность панели">{density === 'compact' ? '⤡' : '⤢'}</button>
           <button className="ic" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')} title="Тема">{theme === 'dark' ? '☀' : '☾'}</button>
