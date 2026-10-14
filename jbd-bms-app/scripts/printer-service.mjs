@@ -2,11 +2,17 @@
 // форматирование сводки и печать по протоколу AlexGyver/Printer
 // (TTL UART, 5–9 В, типично 9600/19200 8N1).
 //
-// Чеки на английском, данные приводятся к ASCII. Читаемость требует
-// совпадения скорости UART и протокола; ASCII сам по себе это не гарантирует. Подписи банков, имена плат и т. п. из
-// данных приводятся к ASCII транслитом.
+// Язык чека выбирается: en — английский (подписи ASCII, кириллица транслитом, работает
+// на любом принтере) и ru — русский (кириллица как есть в cp866 / cp1251 / utf8, нужны
+// русские буквы в шрифте принтера и подходящая кодовая страница ESC t 17 / ESC t 46).
+// Читаемость требует совпадения скорости UART, кодировки и протокола: ASCII сам по себе
+// её не гарантирует, а неверная кодовая страница даёт «мусор» из правильных байтов.
 
-import { ReceiptPrinter, PRINTER_BAUDS, renderReceiptText, toPrinterText, PRINTER_PROFILES, PRINTER_FRAMINGS, STATUS_QUERIES, describeStatusByte, plainReceipt } from './printer.mjs';
+import {
+  ReceiptPrinter, PRINTER_BAUDS, renderReceiptText, toPrinterText, PRINTER_PROFILES, PRINTER_FRAMINGS,
+  STATUS_QUERIES, describeStatusByte, plainReceipt, sanitizeText, encodePrinterText,
+  PRINTER_LANGUAGES, PRINTER_CHARSETS, CHARSET_CODEPAGE,
+} from './printer.mjs';
 
 import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 
@@ -39,6 +45,10 @@ const DEFAULTS = {
   width: Number.isInteger(envWidth) && envWidth >= WIDTH_MIN && envWidth <= WIDTH_MAX ? envWidth : 32,
   framing: PRINTER_FRAMINGS.includes(process.env.BMS_PRINTER_FRAMING || '') ? process.env.BMS_PRINTER_FRAMING : '8N1',
   reportLevel: DEFAULT_REPORT_LEVEL,
+  // язык чека: en — английский (по умолчанию), ru — русский
+  language: PRINTER_LANGUAGES.includes(process.env.BMS_PRINTER_LANGUAGE || '') ? process.env.BMS_PRINTER_LANGUAGE : 'en',
+  // кодировка кириллицы для русского чека: cp866 (по умолчанию), cp1251, utf8
+  charset: PRINTER_CHARSETS.includes(process.env.BMS_PRINTER_CHARSET || '') ? process.env.BMS_PRINTER_CHARSET : 'cp866',
 };
 
 /**
@@ -68,8 +78,10 @@ export class PrinterService {
     if (configFile && existsSync(configFile)) {
       try {
         const saved = JSON.parse(readFileSync(configFile, 'utf8'));
-        // старый printer.json без вида чека (или с опечаткой) не должен терять весь файл
+        // старый printer.json без вида чека и языка (или с опечаткой) не должен терять весь файл
         if (saved && !REPORT_LEVELS.includes(saved.reportLevel)) delete saved.reportLevel;
+        if (saved && !PRINTER_LANGUAGES.includes(saved.language)) delete saved.language;
+        if (saved && !PRINTER_CHARSETS.includes(saved.charset)) delete saved.charset;
         this.configure(saved, false);
       } catch (e) { this.log(`Не удалось загрузить настройки принтера: ${e.message}`); }
     }
@@ -90,8 +102,14 @@ export class PrinterService {
       /** вид чека: short (короткий), medium (средний), full (полный) */
       reportLevel: this.config.reportLevel,
       reportLevels: REPORT_LEVELS,
+      /** язык чека: en — английский (ASCII), ru — русский (кириллица) */
+      language: this.config.language,
+      languages: PRINTER_LANGUAGES,
+      /** кодировка кириллицы для русского чека */
+      charset: this.config.charset,
+      charsets: PRINTER_CHARSETS,
+      charsetCodepages: CHARSET_CODEPAGE,
       printing: this.printing,
-      language: 'en',
       // порт отдан принтеру, но на нём висит плата: опрос печатается вместо чека
       busy: this.isPortBusy(this.config.path),
       open: Boolean(this.printer?.isOpen),
@@ -123,6 +141,23 @@ export class PrinterService {
       }
       this.config.reportLevel = level;
     }
+    if (patch.language !== undefined) {
+      const lang = String(patch.language ?? '').trim().toLowerCase();
+      if (!PRINTER_LANGUAGES.includes(lang)) {
+        throw svcError(400, 'BAD_LANGUAGE',
+          `Неизвестный язык чека «${patch.language}»: английский (en) или русский (ru).`);
+      }
+      // порт не закрываем: кодовая страница отправляется перед каждой печатью (см. init)
+      this.config.language = lang;
+    }
+    if (patch.charset !== undefined) {
+      const cs = String(patch.charset ?? '').trim().toLowerCase();
+      if (!PRINTER_CHARSETS.includes(cs)) {
+        throw svcError(400, 'BAD_CHARSET',
+          `Неизвестная кодировка чека «${patch.charset}»: cp866, cp1251 или utf8.`);
+      }
+      this.config.charset = cs;
+    }
     if (patch.profile !== undefined) this.config.profile = patch.profile;
     if (patch.framing !== undefined && patch.framing !== this.config.framing) {
       // формат кадра меняет открытие порта — закрываем старый, откроется заново
@@ -152,7 +187,8 @@ export class PrinterService {
       if (Number.isInteger(w) && w >= WIDTH_MIN && w <= WIDTH_MAX) this.config.width = w;
     }
     if (persist) this._persist();
-    this.log(`конфигурация: ${this.config.path || '(не выбран)'} @ ${this.config.baudRate} ${this.config.framing}, ширина ${this.config.width}, чек ${this.config.reportLevel} на английском (ASCII)`);
+    this.log(`конфигурация: ${this.config.path || '(не выбран)'} @ ${this.config.baudRate} ${this.config.framing}, ширина ${this.config.width}, `
+      + `чек ${this.config.reportLevel}, язык ${this.config.language === 'ru' ? `русский (${this.config.charset})` : 'английский (ASCII)'}`);
     return this.status();
   }
 
@@ -169,6 +205,44 @@ export class PrinterService {
         `Неизвестный вид чека «${requested}»: выберите короткий (short), средний (medium) или полный (full).`);
     }
     return asked;
+  }
+
+  /**
+   * Язык чека для очередной печати: параметр запроса важнее настройки принтера.
+   * @param {string|null|undefined} requested 'en' | 'ru'
+   * @returns {'en'|'ru'}
+   */
+  _lang(requested) {
+    const asked = String(requested ?? '').trim().toLowerCase();
+    if (!asked) return this.config.language;
+    if (!PRINTER_LANGUAGES.includes(asked)) {
+      throw svcError(400, 'BAD_LANGUAGE', `Неизвестный язык чека «${requested}»: английский (en) или русский (ru).`);
+    }
+    return asked;
+  }
+
+  /** Кодировка кириллицы для очередной печати: cp866 / cp1251 / utf8. */
+  _charset(requested) {
+    const asked = String(requested ?? '').trim().toLowerCase();
+    if (!asked) return this.config.charset;
+    if (!PRINTER_CHARSETS.includes(asked)) {
+      throw svcError(400, 'BAD_CHARSET', `Неизвестная кодировка чека «${requested}»: cp866, cp1251 или utf8.`);
+    }
+    return asked;
+  }
+
+  /**
+   * Печать одним видом и на одном языке, не меняя сохранённые настройки:
+   * драйверу временно подставляются язык и кодировка, потом возвращаются свои.
+   */
+  async _printLines(p, lines, language, charset) {
+    const prev = { language: p.language, charset: p.charset };
+    p.language = language;
+    p.charset = charset;
+    try { await p.printLines(lines); } finally {
+      p.language = prev.language;
+      p.charset = prev.charset;
+    }
   }
 
   /** Сохранить настройки на диск (рядом с package.json, файл игнорируется Git). */
@@ -192,12 +266,16 @@ export class PrinterService {
         baudRate: this.config.baudRate,
         width: this.config.width,
         framing: this.config.framing,
+        language: this.config.language,
+        charset: this.config.charset,
       });
     }
-    // ширина могла поменяться после первой печати — порт ради этого не переоткрываем
+    // ширина, язык и кодировка могли поменяться после первой печати — порт не переоткрываем
     this.printer.width = this.config.width;
     this.printer.profile = this.config.profile;
     this.printer.lineDelayMs = this.config.lineDelayMs;
+    this.printer.language = this.config.language;
+    this.printer.charset = this.config.charset;
     return this.printer;
   }
 
@@ -366,7 +444,14 @@ export class PrinterService {
       await p.send(Buffer.from('Hello 123 ABC abc +-*/\r\n\r\n', 'ascii'));
       this.lastError = '';
       this.lastPrintAt = Date.now();
-      return { ok: true, at: this.lastPrintAt, message: 'Байты отправлены. Подтвердите читаемость на бумаге.' };
+      return {
+        ok: true,
+        at: this.lastPrintAt,
+        language: this.config.language,
+        message: this.config.language === 'ru'
+          ? `Байты отправлены (латиница читается всегда). Русский чек печатается в ${this.config.charset}: проверьте его пробной страницей — если вместо букв мусор, смените кодировку.`
+          : 'Байты отправлены. Подтвердите читаемость на бумаге.',
+      };
     } catch (e) {
       this.lastError = e.message;
       throw svcError(502, 'PRINT_FAILED', `Тест UART: ${e.message}`);
@@ -380,7 +465,7 @@ export class PrinterService {
     try {
       await this._closing;
       await p.open();
-      await p.printLines(buildTestPage({ path: p.path, baudRate: p.baudRate, width: p.width }));
+      await p.printLines(buildTestPage({ path: p.path, baudRate: p.baudRate, width: p.width, language: p.language }));
       this.lastError = '';
       this.lastPrintAt = Date.now();
       return { ok: true, at: this.lastPrintAt, path: p.path, baudRate: p.baudRate };
@@ -395,19 +480,22 @@ export class PrinterService {
    * @param {object} bankRow      — строка банка из banks.row()
    * @param {object} fleet        — итоги парка (для сводки "всего в парке")
    * @param {'short'|'medium'|'full'} [level] — вид чека; без него берётся настройка принтера
+   * @param {{language?:'en'|'ru', charset?:'cp866'|'cp1251'|'utf8'}} [opts] — язык чека и кодировка
    */
-  async printBank(bankRow, fleet = null, level = null) {
+  async printBank(bankRow, fleet = null, level = null, opts = {}) {
     if (this.printing) throw svcError(409, 'PRINTER_BUSY', 'Принтер уже печатает.');
     const lvl = this._level(level);
+    const language = this._lang(opts.language);
+    const charset = this._charset(opts.charset);
     const p = this._ensure();
     this.printing = true;
     try {
       await this._closing;
       await p.open();
-      await p.printLines(buildBankReceipt(bankRow, fleet, p.width, lvl));
+      await this._printLines(p, buildBankReceipt(bankRow, fleet, p.width, lvl, language), language, charset);
       this.lastError = '';
       this.lastPrintAt = Date.now();
-      return { ok: true, at: this.lastPrintAt, bank: bankRow.label, path: p.path, level: lvl };
+      return { ok: true, at: this.lastPrintAt, bank: bankRow.label, path: p.path, level: lvl, language, charset };
     } catch (e) {
       this.lastError = e.message;
       throw svcError(502, 'PRINT_FAILED', `Печать сводки не удалась: ${e.message}`);
@@ -419,47 +507,84 @@ export class PrinterService {
    * @param {object[]} rows — строки банков из banks.row()
    * @param {object} fleet  — итоги парка
    * @param {'short'|'medium'|'full'} [level] — вид чека; без него берётся настройка принтера
+   * @param {{language?:'en'|'ru', charset?:'cp866'|'cp1251'|'utf8'}} [opts] — язык чека и кодировка
    */
-  async printFleet(rows, fleet, level = null) {
+  async printFleet(rows, fleet, level = null, opts = {}) {
     if (this.printing) throw svcError(409, 'PRINTER_BUSY', 'Принтер уже печатает.');
     const lvl = this._level(level);
+    const language = this._lang(opts.language);
+    const charset = this._charset(opts.charset);
     const p = this._ensure();
     this.printing = true;
     try {
       await this._closing;
       await p.open();
-      await p.printLines(buildFleetReceipt(rows, fleet, p.width, lvl));
+      await this._printLines(p, buildFleetReceipt(rows, fleet, p.width, lvl, language), language, charset);
       this.lastError = '';
       this.lastPrintAt = Date.now();
-      return { ok: true, at: this.lastPrintAt, banks: rows.length, path: p.path, level: lvl };
+      return { ok: true, at: this.lastPrintAt, banks: rows.length, path: p.path, level: lvl, language, charset };
     } catch (e) {
       this.lastError = e.message;
       throw svcError(502, 'PRINT_FAILED', `Печать сводки по парку не удалась: ${e.message}`);
     } finally { this.printing = false; }
   }
 
-  // ---------- предпросмотр: тот же чек обычным текстом, без принтера ----------
+  // ---------- предпросмотр: тот же чек текстом, без принтера ----------
 
-  _render(lines, width) {
-    return renderReceiptText(this.config.profile === 'plain' ? plainReceipt(lines) : lines, width);
+  /**
+   * Предпросмотр обязан совпадать с бумагой, поэтому для русского чека
+   * строки не только показываются, но и кодируются в буфер принтера: из него
+   * видно, какие байты уйдут в UART и не попал ли в текст «?».
+   */
+  _render(lines, width, language = this.config.language, charset = this.config.charset) {
+    const prepared = this.config.profile === 'plain' ? plainReceipt(lines) : lines;
+    const shown = renderReceiptText(prepared, width, { language });
+    const bytes = Buffer.concat(
+      shown.map((line) => Buffer.concat([encodePrinterText(line, { language, charset }), Buffer.from([0x0d, 0x0a])])),
+    );
+    return { shown, bytes };
+  }
+
+  /**
+   * Общее для всех предпросмотров: вид чека, язык, кодировка и байты для UART.
+   * `lines` — так чек ляжет на бумагу (тот же текст, что и `text`), `raw` — команды
+   * раскладки до рендера, `bytes` — ровно те байты, что уйдут в принтер.
+   */
+  _preview(kind, level, lines, width, language = this.config.language) {
+    const { shown, bytes } = this._render(lines, width, language);
+    return {
+      kind,
+      level,
+      width,
+      language,
+      charset: language === 'ru' ? this.config.charset : null,
+      lines: shown,
+      text: shown,
+      raw: lines,
+      bytes,
+    };
   }
 
   previewTest() {
     const width = this.config.width;
-    const lines = buildTestPage({ path: this.config.path || '(not selected)', baudRate: this.config.baudRate, width });
-    return { kind: 'test', level: null, width, lines: this._render(lines, width) };
+    const lines = buildTestPage({
+      path: this.config.path || '(not selected)', baudRate: this.config.baudRate, width, language: this.config.language,
+    });
+    return this._preview('test', null, lines, width);
   }
 
-  previewBank(bankRow, fleet = null, level = null) {
+  previewBank(bankRow, fleet = null, level = null, language = null) {
     const width = this.config.width;
     const lvl = this._level(level);
-    return { kind: 'bank', level: lvl, width, lines: this._render(buildBankReceipt(bankRow, fleet, width, lvl), width) };
+    const lang = this._lang(language);
+    return this._preview('bank', lvl, buildBankReceipt(bankRow, fleet, width, lvl, lang), width, lang);
   }
 
-  previewFleet(rows, fleet, level = null) {
+  previewFleet(rows, fleet, level = null, language = null) {
     const width = this.config.width;
     const lvl = this._level(level);
-    return { kind: 'fleet', level: lvl, width, lines: this._render(buildFleetReceipt(rows, fleet, width, lvl), width) };
+    const lang = this._lang(language);
+    return this._preview('fleet', lvl, buildFleetReceipt(rows, fleet, width, lvl, lang), width, lang);
   }
 
   async close() {
@@ -469,38 +594,69 @@ export class PrinterService {
   }
 }
 
-// ---------- форматирование чека: английский текст, только ASCII ----------
+// ---------- форматирование чека: английский (ASCII) или русский (cp866/cp1251/utf8) ----------
 
 const pad2 = (v) => String(v).padStart(2, '0');
 const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
-/** Число с десятичной точкой и единицей: «41.23 V»; нет значения — «n/a». */
-const num = (v, d = 0, unit = '') => (isNum(v) ? `${v.toFixed(d)}${unit ? ` ${unit}` : ''}` : 'n/a');
-/** Милливольты → вольты с тремя знаками: 3301 → «3.301 V». */
-const volts = (mv) => (isNum(mv) ? `${(mv / 1000).toFixed(3)} V` : 'n/a');
-/** Температура: −999 и ниже абсолютного нуля значит «датчиков нет». */
-const temp = (t) => (isNum(t) && t > -273 ? `${t.toFixed(1)} C` : 'n/a');
-const onOff = (v) => (v === null || v === undefined ? 'n/a' : v ? 'on' : 'OFF');
-const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
-/** Остаток / полная ёмкость, А·ч. */
-const ah = (rem, full, d = 2) => {
-  if (!isNum(rem)) return 'n/a';
-  return isNum(full) ? `${rem.toFixed(d)} / ${full.toFixed(d)} Ah` : `${rem.toFixed(d)} Ah`;
+
+/** Форматирование чисел под язык чека: 39.71 V (en) и 39,71 В (ru). */
+const FMT_EN = {
+  na: 'n/a',
+  num: (v, d = 0, unit = '') => (isNum(v) ? `${v.toFixed(d)}${unit ? ` ${unit}` : ''}` : 'n/a'),
+  volts: (mv) => (isNum(mv) ? `${(mv / 1000).toFixed(3)} V` : 'n/a'),
+  temp: (t) => (isNum(t) && t > -273 ? `${t.toFixed(1)} C` : 'n/a'),
+  onOff: (v) => (v === null || v === undefined ? 'n/a' : v ? 'on' : 'OFF'),
+  // время «ГГГГ-ММ-ДД ЧЧ:ММ» — однозначно для английского чека
+  time: (ts) => {
+    if (!ts) return 'n/a';
+    const d = new Date(ts);
+    return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  },
+  ah: (rem, full, d = 2) => {
+    if (!isNum(rem)) return 'n/a';
+    return isNum(full) ? `${rem.toFixed(d)} / ${full.toFixed(d)} Ah` : `${rem.toFixed(d)} Ah`;
+  },
 };
 
-/** Время «ГГГГ-ММ-ДД ЧЧ:ММ» — однозначно для английского чека. */
-function fmtTime(ts) {
-  if (!ts) return 'n/a';
-  const d = new Date(ts);
-  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
-}
+/** Русский чек: запятая в дробях, единицы по-русски, «н/д» вместо «n/a». */
+const FMT_RU = {
+  na: 'н/д',
+  num: (v, d = 0, unit = '') => (isNum(v) ? `${v.toFixed(d).replace('.', ',')}${unit ? ` ${unit}` : ''}` : 'н/д'),
+  volts: (mv) => (isNum(mv) ? `${(mv / 1000).toFixed(3).replace('.', ',')} В` : 'н/д'),
+  temp: (t) => (isNum(t) && t > -273 ? `${t.toFixed(1).replace('.', ',')} °C` : 'н/д'),
+  onOff: (v) => (v === null || v === undefined ? 'н/д' : v ? 'вкл' : 'выкл'),
+  // время «ДД.ММ.ГГГГ ЧЧ:ММ» — привычная русская запись
+  time: (ts) => {
+    if (!ts) return 'н/д';
+    const d = new Date(ts);
+    return `${pad2(d.getDate())}.${pad2(d.getMonth() + 1)}.${d.getFullYear()} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  },
+  ah: (rem, full, d = 2) => {
+    if (!isNum(rem)) return 'н/д';
+    const f = (v) => v.toFixed(d).replace('.', ',');
+    return isNum(full) ? `${f(rem)} / ${f(full)} Ач` : `${f(rem)} Ач`;
+  },
+};
 
-/** Дата паспорта платы «ДД.ММ.ГГГГ» → «ГГГГ-ММ-ДД». */
+/** Дата паспорта платы «ДД.ММ.ГГГГ» → «ГГГГ-ММ-ДД» (в русском чеке остаётся как на плате). */
 function isoDate(s) {
   const m = /^(\d{1,2})\.(\d{1,2})\.(\d{4})$/.exec(String(s ?? '').trim());
   return m ? `${m[3]}-${pad2(m[2])}-${pad2(m[1])}` : String(s ?? '');
 }
 
-/** Защиты по-английски (ключи — как в FAULT_BITS протокола). */
+/** Русские окончания: 1 банка, 2 банки, 5 банок. */
+const pluralRu = (n, forms) => {
+  const m10 = n % 10, m100 = n % 100;
+  if (m10 === 1 && m100 !== 11) return forms[0];
+  if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return forms[1];
+  return forms[2];
+};
+
+/**
+ * Защиты по-английски (ключи — как в FAULT_BITS протокола).
+ * В русском чеке для известных ключей берётся FAULT_NAMES_RU (те же слова, что и
+ * на панели, и они гарантированно русские), для незнакомых — название с платы (label).
+ */
 export const FAULT_NAMES_EN = {
   covp: 'Cell overvoltage',
   cuvp: 'Cell undervoltage',
@@ -516,13 +672,120 @@ export const FAULT_NAMES_EN = {
   afe: 'AFE chip error',
   software: 'Software lock',
 };
+
+export const FAULT_NAMES_RU = {
+  covp: 'Перенапряжение ячейки',
+  cuvp: 'Понижение ячейки',
+  povp: 'Перенапряжение батареи',
+  puvp: 'Понижение батареи',
+  chgot: 'Перегрев заряда',
+  chgut: 'Переохлаждение заряда',
+  dsgot: 'Перегрев разряда',
+  dsgut: 'Переохлаждение разряда',
+  chgoc: 'Перегрузка заряда',
+  dsgoc: 'Перегрузка разряда',
+  sc: 'Короткое замыкание',
+  afe: 'Ошибка чипа AFE',
+  software: 'Программная блокировка',
+};
+
 const faultName = (f) => FAULT_NAMES_EN[f?.key] ?? (toPrinterText(f?.label || f?.key || '') || 'Unknown fault');
+const faultNameRu = (f) => {
+  const label = sanitizeText(f?.label || '').trim();
+  return FAULT_NAMES_RU[f?.key] ?? (label || `Защита ${f?.key ?? '?'}`);
+};
+
+/**
+ * Подписи чека. Английский набор — прежний, русский — короткие слова,
+ * которые влезают в строку 24 символа рядом со значением.
+ */
+function labels(lang) {
+  if (lang === 'ru') {
+    return {
+      bankTitle: 'АККУМУЛЯТОР',
+      fleetTitle: 'ВСЕ АККУМУЛЯТОРЫ',
+      fleetSubtitle: 'Сводный чек',
+      report: 'Вид', status: 'Состояние', online: 'на связи', offline: 'НЕТ СВЯЗИ',
+      onlineHead: 'На связи', offlineHead: 'Нет связи', updated: 'Обновлено', port: 'Порт',
+      levels: { short: 'короткий', medium: 'средний', full: 'полный' },
+      main: 'ОСНОВНЫЕ ЗНАЧЕНИЯ',
+      voltage: 'Напряжение', current: 'Ток', power: 'Мощность', soc: 'Заряд', remaining: 'Остаток',
+      cycles: 'Циклы', cellsInSeries: 'Банок в сборке', cells: 'Банок',
+      cellsHead: 'БАНКИ', lowest: 'Мин. банка', highest: 'Макс. банка', average: 'Средняя', delta: 'Разброс Δ',
+      noCellData: '- данных по банкам нет -',
+      cellDetail: 'ПО БАНКАМ', deviation: 'отклонение от среднего', balancingMark: 'b = балансировка',
+      legendMin: '! мин', legendMax: '^ макс', legendBal: 'b баланс',
+      temps: 'ТЕМПЕРАТУРЫ', sensor: (i) => `Датчик ${i + 1}`, noSensors: '- датчиков нет -',
+      maxTemp: 'Макс. температура', highLow: 'Макс / мин',
+      switches: 'КЛЮЧИ И ЗАЩИТЫ', chargeFet: 'Ключ заряда', dischargeFet: 'Ключ разряда', balancing: 'Балансировка',
+      balancingNone: 'нет', balancingCells: (n) => `${n} ${pluralRu(n, ['банка', 'банки', 'банок'])}`,
+      protections: 'Защиты', noneActive: 'нет активных', active: (n) => `активно: ${n}`,
+      faultRegister: 'Регистр защит',
+      counters: 'СЧЁТЧИКИ ЗАЩИТ', allZero: '- все нули -',
+      board: 'ПЛАТА', hardware: 'Версия платы', firmware: 'Прошивка', serial: 'Серийный №', manufactured: 'Выпущена',
+      fleetOnline: (on, all) => `НА СВЯЗИ: ${on}/${all}`,
+      totalCurrent: 'Суммарный ток', totalPower: 'Суммарная мощность', totalRemaining: 'Остаток всего',
+      maxCellDelta: 'Макс. разброс', balancingCount: 'Балансируются', cyclesMax: 'Циклов (макс)',
+      fetsOff: 'Ключи выкл з/р',
+      boards: 'Плат', avgVoltage: 'Среднее напряжение', avgSoc: 'Средний заряд', activeProtections: 'Активных защит',
+      maxPower: 'Макс. мощность', extremeCell: 'Крайние банки',
+      batteries: 'АККУМУЛЯТОРЫ', noData: '- нет данных -', totalCurrentShort: 'Ток',
+      min: 'мин', max: 'макс', chargeShort: 'Заряд', deltaShort: 'разброс',
+      packUnit: { v: 'В', a: 'А', w: 'Вт', soc: '%', mv: 'мВ', ah: 'Ач' },
+      model: 'Модель', footer: 'Напечатано JBD BMS',
+      // короткие подписи для плотной строки фактов в полном чеке по парку
+      facts: {
+        sensors: (list) => `Датчики ${list} °C`,
+        cycles: 'циклы', balancing: 'балансировка', chargeFet: 'ключ заряда', dischargeFet: 'ключ разряда',
+        model: 'модель', hardware: 'плата', firmware: 'прошивка', serial: '№', made: 'выпуск',
+      },
+    };
+  }
+  return {
+    bankTitle: 'BATTERY REPORT',
+    fleetTitle: 'ALL BATTERIES',
+    fleetSubtitle: 'Summary report',
+    report: 'Report', status: 'Status', online: 'online', offline: 'OFFLINE',
+    onlineHead: 'Online', offlineHead: 'Offline', updated: 'Updated', port: 'Port',
+    levels: { short: 'short', medium: 'medium', full: 'full' },
+    main: 'MAIN READINGS',
+    voltage: 'Voltage', current: 'Current', power: 'Power', soc: 'State of charge', remaining: 'Remaining',
+    cycles: 'Cycles', cellsInSeries: 'Cells in series', cells: 'Cells',
+    cellsHead: 'CELLS', lowest: 'Lowest cell', highest: 'Highest cell', average: 'Average', delta: 'Delta (max-min)',
+    noCellData: '- no cell data -',
+    cellDetail: 'CELL DETAIL', deviation: 'deviation from average', balancingMark: 'b = balancing',
+    legendMin: '! min', legendMax: '^ max', legendBal: 'b balancing',
+    temps: 'TEMPERATURES', sensor: (i) => `Sensor T${i + 1}`, noSensors: '- no sensors -',
+    maxTemp: 'Max temperature', highLow: 'High / low',
+    switches: 'SWITCHES & PROTECTION', chargeFet: 'Charge FET', dischargeFet: 'Discharge FET', balancing: 'Balancing',
+    balancingNone: 'none', balancingCells: (n) => `${n} cell${n === 1 ? '' : 's'}`,
+    protections: 'Protections', noneActive: 'none active', active: (n) => `${n} ACTIVE`,
+    faultRegister: 'Fault register',
+    counters: 'PROTECTION COUNTERS', allZero: '- all zero -',
+    board: 'BOARD', hardware: 'Hardware', firmware: 'Firmware', serial: 'Serial no.', manufactured: 'Manufactured',
+    fleetOnline: (on, all) => `ALL BATTERIES: ${on}/${all} ONLINE`,
+    totalCurrent: 'Total current', totalPower: 'Total power', totalRemaining: 'Total remaining',
+    maxCellDelta: 'Max cell delta', balancingCount: 'Balancing cells', cyclesMax: 'Cycles (max)',
+    fetsOff: 'FETs off chg/dsg',
+    boards: 'Boards', avgVoltage: 'Average voltage', avgSoc: 'Average SOC', activeProtections: 'Active protections',
+    maxPower: 'Max power', extremeCell: 'Extreme cell V',
+    batteries: 'BATTERIES', noData: '- no data -', totalCurrentShort: 'Total current',
+    min: 'min', max: 'max', chargeShort: 'SOC', deltaShort: 'delta',
+    packUnit: { v: 'V', a: 'A', w: 'W', soc: '%', mv: 'mV', ah: 'Ah' },
+    model: 'Model', footer: 'Printed by JBD BMS',
+    facts: {
+      sensors: (list) => `T ${list} C`,
+      cycles: 'cycles', balancing: 'balancing', chargeFet: 'chg FET', dischargeFet: 'dsg FET',
+      model: 'model', hardware: 'hw', firmware: 'fw', serial: 'sn', made: 'made',
+    },
+  };
+}
 
 /** Сложить короткие фрагменты в строки не шире width, не разрывая фрагмент. */
 function packBits(bits, width, sep = '  ') {
   const out = [];
   let cur = '';
-  for (const bit of bits.map((b) => toPrinterText(b)).filter(Boolean)) {
+  for (const bit of bits.map((b) => sanitizeText(b)).filter(Boolean)) {
     if (!cur) cur = bit;
     else if (cur.length + sep.length + bit.length <= width) cur += sep + bit;
     else { out.push(cur); cur = bit; }
@@ -535,10 +798,10 @@ function packBits(bits, width, sep = '  ') {
  * Ячейки компактной сеткой: «#01 3320mV» + метки (! — минимальная,
  * ^ — максимальная, b — балансируется). Колонок столько, сколько влезает.
  */
-function cellGrid(cells, st, balancing, width) {
+function cellGrid(cells, st, balancing, width, L, mv = 'mV') {
   const marked = st && st.delta > 0;
   const items = cells.map((v, i) => {
-    let s = `#${pad2(i + 1)} ${isNum(v) ? Math.round(v) : '----'}mV`;
+    let s = `#${pad2(i + 1)} ${isNum(v) ? Math.round(v) : '----'}${mv}`;
     if (marked && i === st.minIndex) s += '!';
     else if (marked && i === st.maxIndex) s += '^';
     if (balancing?.includes(i + 1)) s += 'b';
@@ -553,32 +816,34 @@ function cellGrid(cells, st, balancing, width) {
     rows.push(part.map((s, j) => (j < part.length - 1 ? s.padEnd(slot) : s)).join(''));
   }
   const legend = [];
-  if (marked) legend.push('! min', '^ max');
-  if (balancing?.length) legend.push('b balancing');
+  if (marked) legend.push(L.legendMin, L.legendMax);
+  if (balancing?.length) legend.push(L.legendBal);
   return { rows, legend };
 }
 
-function buildTestPage({ path, baudRate, width }) {
+/** Пробная страница: проверка связи и ширины строки. Печатается на языке чека. */
+function buildTestPage({ path, baudRate, width, language = 'en' }) {
+  const ru = language === 'ru';
   const ruler = Array.from({ length: width }, (_, i) => String((i + 1) % 10)).join('');
   return [
     { t: 'text', text: 'JBD BMS', align: 1, bold: true, size: 'big' },
-    { t: 'text', text: 'PRINTER TEST', align: 1, bold: true },
+    { t: 'text', text: ru ? 'ПРОБНАЯ СТРАНИЦА' : 'PRINTER TEST', align: 1, bold: true },
     { t: 'divider' },
-    { t: 'row', left: 'Port', right: path },
-    { t: 'row', left: 'Baud rate', right: `${baudRate} baud` },
-    { t: 'row', left: 'Line width', right: `${width} chars` },
-    { t: 'row', left: 'Language', right: 'English (ASCII)' },
+    { t: 'row', left: ru ? 'Порт' : 'Port', right: path },
+    { t: 'row', left: ru ? 'Скорость' : 'Baud rate', right: `${baudRate} ${ru ? 'бод' : 'baud'}` },
+    { t: 'row', left: ru ? 'Ширина' : 'Line width', right: `${width} ${ru ? 'симв.' : 'chars'}` },
+    { t: 'row', left: ru ? 'Язык' : 'Language', right: ru ? 'Русский' : 'English (ASCII)' },
     { t: 'divider' },
-    { t: 'text', text: 'If you can read this text, the printer works.' },
+    { t: 'text', text: ru ? 'Если этот текст читается — принтер работает.' : 'If you can read this text, the printer works.' },
     { t: 'blank', n: 1 },
     { t: 'text', text: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' },
     { t: 'text', text: 'abcdefghijklmnopqrstuvwxyz' },
     { t: 'text', text: '0123456789 +-*/=%#.,:;!?()[]' },
     { t: 'blank', n: 1 },
-    { t: 'text', text: 'Width check (1 line = OK):' },
+    { t: 'text', text: ru ? 'Проверка ширины (одна строка = норма):' : 'Width check (1 line = OK):' },
     { t: 'text', text: ruler },
     { t: 'blank', n: 1 },
-    { t: 'text', text: fmtTime(Date.now()), align: 1 },
+    { t: 'text', text: (ru ? FMT_RU : FMT_EN).time(Date.now()), align: 1 },
     { t: 'feed', n: 4 },
   ];
 }
@@ -586,6 +851,7 @@ function buildTestPage({ path, baudRate, width }) {
 /**
  * Блок для перебора скоростей: на «своей» скорости текст читается, на чужой
  * выходит мусор — по бумаге видно, какая строка настоящая.
+ * Всегда ASCII: он должен быть понятен даже при неверной кодовой странице.
  */
 function baudSweepLines(baudRate, framing) {
   return [
@@ -600,49 +866,54 @@ function baudSweepLines(baudRate, framing) {
  * Чек по одному аккумулятору. Вид чека (level) решает, сколько блоков попадёт
  * на бумагу: короткий — только главное, средний — ещё сетка банок и температуры,
  * полный — плюс каждая банка строкой, счётчики защит, паспорт платы и итоги парка.
+ * Язык (language) выбирает подписи: английские ASCII или русские (cp866/cp1251/utf8).
  */
-function buildBankReceipt(b, fleet, width = 32, level = DEFAULT_REPORT_LEVEL) {
+function buildBankReceipt(b, fleet, width = 32, level = DEFAULT_REPORT_LEVEL, language = 'en') {
   const lvl = levelOf(level);
+  const ru = language === 'ru';
+  const L = labels(ru ? 'ru' : 'en');
+  const F = ru ? FMT_RU : FMT_EN;
+  const faultOf = ru ? faultNameRu : faultName;
   const brief = lvl === 'short';
   const full = lvl === 'full';
   const st = b.stats;
   const T = b.temperatures || [];
   const cells = b.cells || [];
   const lines = [];
-  lines.push({ t: 'text', text: 'BATTERY REPORT', align: 1, bold: true, size: 'big' });
+  lines.push({ t: 'text', text: L.bankTitle, align: 1, bold: true, size: 'big' });
   lines.push({ t: 'text', text: b.label, align: 1, bold: true });
   if (b.deviceName && b.deviceName !== b.label) lines.push({ t: 'text', text: b.deviceName, align: 1 });
-  if (b.model) lines.push({ t: 'text', text: `Model: ${b.model}`, align: 1 });
+  if (b.model) lines.push({ t: 'text', text: `${L.model}: ${b.model}`, align: 1 });
   lines.push({ t: 'divider' });
 
-  lines.push({ t: 'row', left: 'Report', right: lvl });
-  lines.push({ t: 'row', left: 'Status', right: b.connected ? 'online' : 'OFFLINE' });
-  lines.push({ t: 'row', left: 'Updated', right: fmtTime(b.at) });
-  if (!brief) lines.push({ t: 'row', left: 'Port', right: b.demo ? 'demo' : b.path });
+  lines.push({ t: 'row', left: L.report, right: L.levels[lvl] });
+  lines.push({ t: 'row', left: L.status, right: b.connected ? L.online : L.offline });
+  lines.push({ t: 'row', left: L.updated, right: F.time(b.at) });
+  if (!brief) lines.push({ t: 'row', left: L.port, right: b.demo ? 'demo' : b.path });
   lines.push({ t: 'divider' });
 
   // В коротком чеке заголовки блоков не печатаются: экономим строки бумаги.
-  if (!brief) lines.push({ t: 'text', text: 'MAIN READINGS', bold: true });
-  lines.push({ t: 'row', left: 'Voltage', right: num(b.voltage, 2, 'V') });
-  lines.push({ t: 'row', left: 'Current', right: num(b.current, 2, 'A') });
-  lines.push({ t: 'row', left: 'Power', right: num(b.power, 1, 'W') });
-  lines.push({ t: 'row', left: 'State of charge', right: num(b.soc, 0, '%') });
-  lines.push({ t: 'row', left: 'Remaining', right: ah(b.remainingAh, b.fullAh) });
-  if (!brief) lines.push({ t: 'row', left: 'Cycles', right: isNum(b.cycles) ? String(b.cycles) : 'n/a' });
-  lines.push({ t: 'row', left: brief ? 'Cells' : 'Cells in series', right: `${b.cellCount || cells.length}S` });
+  if (!brief) lines.push({ t: 'text', text: L.main, bold: true });
+  lines.push({ t: 'row', left: L.voltage, right: F.num(b.voltage, 2, L.packUnit.v) });
+  lines.push({ t: 'row', left: L.current, right: F.num(b.current, 2, L.packUnit.a) });
+  lines.push({ t: 'row', left: L.power, right: F.num(b.power, 1, L.packUnit.w) });
+  lines.push({ t: 'row', left: L.soc, right: F.num(b.soc, 0, L.packUnit.soc) });
+  lines.push({ t: 'row', left: L.remaining, right: F.ah(b.remainingAh, b.fullAh) });
+  if (!brief) lines.push({ t: 'row', left: L.cycles, right: isNum(b.cycles) ? String(b.cycles) : F.na });
+  lines.push({ t: 'row', left: brief ? L.cells : L.cellsInSeries, right: `${b.cellCount || cells.length}S` });
   lines.push({ t: 'divider' });
 
-  if (!brief) lines.push({ t: 'text', text: 'CELLS', bold: true });
+  if (!brief) lines.push({ t: 'text', text: L.cellsHead, bold: true });
   if (st) {
-    lines.push({ t: 'row', left: 'Lowest cell', right: `#${st.minIndex + 1}  ${volts(st.min)}` });
-    lines.push({ t: 'row', left: 'Highest cell', right: `#${st.maxIndex + 1}  ${volts(st.max)}` });
-    if (!brief) lines.push({ t: 'row', left: 'Average', right: volts(st.avg) });
-    lines.push({ t: 'row', left: 'Delta (max-min)', right: num(st.delta, 0, 'mV') });
+    lines.push({ t: 'row', left: L.lowest, right: `#${st.minIndex + 1}  ${F.volts(st.min)}` });
+    lines.push({ t: 'row', left: L.highest, right: `#${st.maxIndex + 1}  ${F.volts(st.max)}` });
+    if (!brief) lines.push({ t: 'row', left: L.average, right: F.volts(st.avg) });
+    lines.push({ t: 'row', left: L.delta, right: F.num(st.delta, 0, L.packUnit.mv) });
   } else {
-    lines.push({ t: 'text', text: '- no cell data -' });
+    lines.push({ t: 'text', text: L.noCellData });
   }
   if (cells.length && !brief) {
-    const grid = cellGrid(cells, st, b.balancingCells, width);
+    const grid = cellGrid(cells, st, b.balancingCells, width, L, L.packUnit.mv);
     lines.push({ t: 'blank', n: 1 });
     for (const row of grid.rows) lines.push({ t: 'text', text: row });
     for (const row of packBits(grid.legend, width)) lines.push({ t: 'text', text: row });
@@ -651,47 +922,47 @@ function buildBankReceipt(b, fleet, width = 32, level = DEFAULT_REPORT_LEVEL) {
     // полный чек: каждая банка отдельной строкой с отклонением и меткой балансировки
     const bal = new Set(b.balancingCells ?? []);
     lines.push({ t: 'blank', n: 1 });
-    for (const part of packBits(['CELL DETAIL', 'deviation from average', 'b = balancing'], width)) {
+    for (const part of packBits([L.cellDetail, L.deviation, L.balancingMark], width)) {
       lines.push({ t: 'text', text: part });
     }
     cells.forEach((mv, i) => {
       const dev = st ? Math.round(mv - st.avg) : null;
-      const devText = dev == null ? '' : `  ${dev > 0 ? '+' : ''}${dev} mV`;
-      lines.push({ t: 'text', text: `#${pad2(i + 1)}  ${volts(mv)}${devText}${bal.has(i + 1) ? '  b' : ''}` });
+      const devText = dev == null ? '' : `  ${dev > 0 ? '+' : ''}${ru ? String(dev).replace('.', ',') : dev} ${L.packUnit.mv}`;
+      lines.push({ t: 'text', text: `#${pad2(i + 1)}  ${F.volts(mv)}${devText}${bal.has(i + 1) ? '  b' : ''}` });
     });
   }
   lines.push({ t: 'divider' });
 
-  if (!brief) lines.push({ t: 'text', text: 'TEMPERATURES', bold: true });
+  if (!brief) lines.push({ t: 'text', text: L.temps, bold: true });
   if (T.length) {
     if (brief) {
-      lines.push({ t: 'row', left: 'Max temperature', right: temp(Math.max(...T)) });
+      lines.push({ t: 'row', left: L.maxTemp, right: F.temp(Math.max(...T)) });
     } else {
-      T.forEach((t, i) => lines.push({ t: 'row', left: `Sensor T${i + 1}`, right: temp(t) }));
-      if (full && T.length > 1) lines.push({ t: 'row', left: 'High / low', right: `${temp(Math.max(...T))} / ${temp(Math.min(...T))}` });
+      T.forEach((t, i) => lines.push({ t: 'row', left: L.sensor(i), right: F.temp(t) }));
+      if (full && T.length > 1) lines.push({ t: 'row', left: L.highLow, right: `${F.temp(Math.max(...T))} / ${F.temp(Math.min(...T))}` });
     }
   } else {
-    lines.push({ t: 'text', text: '- no sensors -' });
+    lines.push({ t: 'text', text: L.noSensors });
   }
   lines.push({ t: 'divider' });
 
   if (brief) {
     // короткий чек: только счётчик защит и первые срабатывания
-    lines.push({ t: 'row', left: 'Protections', right: b.faults?.length ? `${b.faults.length} ACTIVE` : 'none active', bold: Boolean(b.faults?.length) });
-    for (const f of (b.faults ?? []).slice(0, 2)) lines.push({ t: 'text', text: `! ${faultName(f)}` });
+    lines.push({ t: 'row', left: L.protections, right: b.faults?.length ? L.active(b.faults.length) : L.noneActive, bold: Boolean(b.faults?.length) });
+    for (const f of (b.faults ?? []).slice(0, 2)) lines.push({ t: 'text', text: `! ${faultOf(f)}` });
   } else {
-    lines.push({ t: 'text', text: 'SWITCHES & PROTECTION', bold: true });
-    lines.push({ t: 'row', left: 'Charge FET', right: onOff(b.chargeFetOn) });
-    lines.push({ t: 'row', left: 'Discharge FET', right: onOff(b.dischargeFetOn) });
-    lines.push({ t: 'row', left: 'Balancing', right: b.balancingCells?.length ? plural(b.balancingCells.length, 'cell') : 'none' });
+    lines.push({ t: 'text', text: L.switches, bold: true });
+    lines.push({ t: 'row', left: L.chargeFet, right: F.onOff(b.chargeFetOn) });
+    lines.push({ t: 'row', left: L.dischargeFet, right: F.onOff(b.dischargeFetOn) });
+    lines.push({ t: 'row', left: L.balancing, right: b.balancingCells?.length ? L.balancingCells(b.balancingCells.length) : L.balancingNone });
     if (b.faults?.length) {
-      lines.push({ t: 'row', left: 'Protections', right: `${b.faults.length} ACTIVE`, bold: true });
-      for (const f of b.faults.slice(0, 13)) lines.push({ t: 'text', text: `! ${faultName(f)}` });
+      lines.push({ t: 'row', left: L.protections, right: L.active(b.faults.length), bold: true });
+      for (const f of b.faults.slice(0, 13)) lines.push({ t: 'text', text: `! ${faultOf(f)}` });
     } else {
-      lines.push({ t: 'row', left: 'Protections', right: 'none active' });
+      lines.push({ t: 'row', left: L.protections, right: L.noneActive });
     }
     if (full && isNum(b.faultRaw)) {
-      lines.push({ t: 'row', left: 'Fault register', right: `0x${(b.faultRaw >>> 0).toString(16).padStart(4, '0')}` });
+      lines.push({ t: 'row', left: L.faultRegister, right: `0x${(b.faultRaw >>> 0).toString(16).padStart(4, '0')}` });
     }
   }
   lines.push({ t: 'divider' });
@@ -699,124 +970,130 @@ function buildBankReceipt(b, fleet, width = 32, level = DEFAULT_REPORT_LEVEL) {
   if (full) {
     // счётчики срабатываний защит (регистр 0xAA): ненулевые — история платы
     const counters = Object.entries(b.errors ?? {}).filter(([, v]) => isNum(v) && v > 0);
-    lines.push({ t: 'text', text: 'PROTECTION COUNTERS', bold: true });
+    lines.push({ t: 'text', text: L.counters, bold: true });
     if (counters.length) {
-      for (const [key, v] of counters) lines.push({ t: 'row', left: faultName({ key }), right: String(v) });
+      for (const [key, v] of counters) lines.push({ t: 'row', left: faultOf({ key }), right: String(v) });
     } else {
-      lines.push({ t: 'text', text: '- all zero -' });
+      lines.push({ t: 'text', text: L.allZero });
     }
     lines.push({ t: 'divider' });
   }
 
   if (full && (b.hwVersion || b.swVersion || b.serial || b.prodDate)) {
-    lines.push({ t: 'text', text: 'BOARD', bold: true });
-    if (b.hwVersion) lines.push({ t: 'row', left: 'Hardware', right: b.hwVersion });
-    if (b.swVersion) lines.push({ t: 'row', left: 'Firmware', right: b.swVersion });
-    if (b.serial) lines.push({ t: 'row', left: 'Serial no.', right: b.serial });
-    if (b.prodDate) lines.push({ t: 'row', left: 'Manufactured', right: isoDate(b.prodDate) });
+    lines.push({ t: 'text', text: L.board, bold: true });
+    if (b.hwVersion) lines.push({ t: 'row', left: L.hardware, right: b.hwVersion });
+    if (b.swVersion) lines.push({ t: 'row', left: L.firmware, right: b.swVersion });
+    if (b.serial) lines.push({ t: 'row', left: L.serial, right: b.serial });
+    if (b.prodDate) lines.push({ t: 'row', left: L.manufactured, right: ru ? String(b.prodDate) : isoDate(b.prodDate) });
     lines.push({ t: 'divider' });
   }
 
   if (fleet && fleet.banks > 1 && !brief) {
-    lines.push({ t: 'text', text: `ALL BATTERIES: ${fleet.online}/${fleet.banks} ONLINE`, bold: true, align: 1 });
-    lines.push({ t: 'row', left: 'Total current', right: num(fleet.currentSum, 2, 'A') });
-    lines.push({ t: 'row', left: 'Total power', right: num(fleet.powerSum, 1, 'W') });
-    lines.push({ t: 'row', left: 'Total remaining', right: ah(fleet.ahSum, fleet.ahCapacity, 1) });
-    lines.push({ t: 'row', left: 'Max cell delta', right: num(fleet.cellDelta, 0, 'mV') });
-    lines.push({ t: 'row', left: 'Max temperature', right: temp(fleet.tempMax) });
+    lines.push({ t: 'text', text: L.fleetOnline(fleet.online, fleet.banks), bold: true, align: 1 });
+    lines.push({ t: 'row', left: L.totalCurrent, right: F.num(fleet.currentSum, 2, L.packUnit.a) });
+    lines.push({ t: 'row', left: L.totalPower, right: F.num(fleet.powerSum, 1, L.packUnit.w) });
+    lines.push({ t: 'row', left: L.totalRemaining, right: F.ah(fleet.ahSum, fleet.ahCapacity, 1) });
+    lines.push({ t: 'row', left: L.maxCellDelta, right: F.num(fleet.cellDelta, 0, L.packUnit.mv) });
+    lines.push({ t: 'row', left: L.maxTemp, right: F.temp(fleet.tempMax) });
     if (full) {
-      lines.push({ t: 'row', left: 'Balancing cells', right: String(fleet.balancing ?? 0) });
-      lines.push({ t: 'row', left: 'Cycles (max)', right: isNum(fleet.cyclesMax) ? String(fleet.cyclesMax) : 'n/a' });
-      lines.push({ t: 'row', left: 'FETs off chg/dsg', right: `${fleet.chargeFetOff ?? 0}/${fleet.dischargeFetOff ?? 0}` });
+      lines.push({ t: 'row', left: L.balancingCount, right: String(fleet.balancing ?? 0) });
+      lines.push({ t: 'row', left: L.cyclesMax, right: isNum(fleet.cyclesMax) ? String(fleet.cyclesMax) : F.na });
+      lines.push({ t: 'row', left: L.fetsOff, right: `${fleet.chargeFetOff ?? 0}/${fleet.dischargeFetOff ?? 0}` });
     }
     lines.push({ t: 'divider' });
   }
 
-  lines.push({ t: 'text', text: 'Printed by JBD BMS', align: 1 });
-  lines.push({ t: 'text', text: fmtTime(Date.now()), align: 1 });
+  lines.push({ t: 'text', text: L.footer, align: 1 });
+  lines.push({ t: 'text', text: F.time(Date.now()), align: 1 });
   lines.push({ t: 'feed', n: 4 });
   return lines;
 }
 
 /**
- * Чек по всем аккумуляторам (парку). Короткий — итоги и по одной строке на плату,
+ * Чек по всем аккумуляторам (парку). Короткий — итоги и по одной-две строки на плату,
  * средний — по три строки на плату, полный — плюс температуры, циклы, ключи,
  * паспорт каждой платы и все активные защиты.
  */
-function buildFleetReceipt(rows, fleet, width = 32, level = DEFAULT_REPORT_LEVEL) {
+function buildFleetReceipt(rows, fleet, width = 32, level = DEFAULT_REPORT_LEVEL, language = 'en') {
   const lvl = levelOf(level);
+  const ru = language === 'ru';
+  const L = labels(ru ? 'ru' : 'en');
+  const F = ru ? FMT_RU : FMT_EN;
+  const faultOf = ru ? faultNameRu : faultName;
   const brief = lvl === 'short';
   const full = lvl === 'full';
   const lines = [];
-  lines.push({ t: 'text', text: 'ALL BATTERIES', align: 1, bold: true, size: 'big' });
-  lines.push({ t: 'text', text: 'Summary report', align: 1, bold: true });
+  lines.push({ t: 'text', text: L.fleetTitle, align: 1, bold: true, size: 'big' });
+  lines.push({ t: 'text', text: L.fleetSubtitle, align: 1, bold: true });
   lines.push({ t: 'divider' });
-  lines.push({ t: 'row', left: 'Report', right: lvl });
-  lines.push({ t: 'row', left: 'Boards', right: String(fleet?.banks ?? rows.length) });
-  lines.push({ t: 'row', left: 'Online', right: String(fleet?.online ?? rows.filter((r) => r.connected).length) });
-  lines.push({ t: 'row', left: 'Offline', right: String(fleet?.stale ?? rows.filter((r) => !r.connected).length) });
-  lines.push({ t: 'row', left: 'Average voltage', right: num(fleet?.voltageAvg, 2, 'V') });
-  lines.push({ t: 'row', left: 'Total current', right: num(fleet?.currentSum, 2, 'A') });
-  lines.push({ t: 'row', left: 'Total power', right: num(fleet?.powerSum, 1, 'W') });
-  lines.push({ t: 'row', left: 'Total remaining', right: ah(fleet?.ahSum, fleet?.ahCapacity, 1) });
-  lines.push({ t: 'row', left: 'Average SOC', right: num(fleet?.socAvg, 0, '%') });
-  lines.push({ t: 'row', left: 'Max cell delta', right: num(fleet?.cellDelta, 0, 'mV') });
-  lines.push({ t: 'row', left: 'Max temperature', right: temp(fleet?.tempMax) });
-  lines.push({ t: 'row', left: 'Active protections', right: String(fleet?.faults ?? 0) });
+  lines.push({ t: 'row', left: L.report, right: L.levels[lvl] });
+  lines.push({ t: 'row', left: L.boards, right: String(fleet?.banks ?? rows.length) });
+  lines.push({ t: 'row', left: L.onlineHead, right: String(fleet?.online ?? rows.filter((r) => r.connected).length) });
+  lines.push({ t: 'row', left: L.offlineHead, right: String(fleet?.stale ?? rows.filter((r) => !r.connected).length) });
+  lines.push({ t: 'row', left: L.avgVoltage, right: F.num(fleet?.voltageAvg, 2, L.packUnit.v) });
+  lines.push({ t: 'row', left: L.totalCurrentShort, right: F.num(fleet?.currentSum, 2, L.packUnit.a) });
+  lines.push({ t: 'row', left: L.totalPower, right: F.num(fleet?.powerSum, 1, L.packUnit.w) });
+  lines.push({ t: 'row', left: L.totalRemaining, right: F.ah(fleet?.ahSum, fleet?.ahCapacity, 1) });
+  lines.push({ t: 'row', left: L.avgSoc, right: F.num(fleet?.socAvg, 0, L.packUnit.soc) });
+  lines.push({ t: 'row', left: L.maxCellDelta, right: F.num(fleet?.cellDelta, 0, L.packUnit.mv) });
+  lines.push({ t: 'row', left: L.maxTemp, right: F.temp(fleet?.tempMax) });
+  lines.push({ t: 'row', left: L.activeProtections, right: String(fleet?.faults ?? 0) });
   if (full) {
-    lines.push({ t: 'row', left: 'Max power', right: num(fleet?.powerMax, 1, 'W') });
-    lines.push({ t: 'row', left: 'Extreme cell V', right: `${volts(fleet?.cellMin)} / ${volts(fleet?.cellMax)}` });
-    lines.push({ t: 'row', left: 'Balancing cells', right: String(fleet?.balancing ?? 0) });
-    lines.push({ t: 'row', left: 'Cycles (max)', right: isNum(fleet?.cyclesMax) ? String(fleet.cyclesMax) : 'n/a' });
-    lines.push({ t: 'row', left: 'FETs off chg/dsg', right: `${fleet?.chargeFetOff ?? 0}/${fleet?.dischargeFetOff ?? 0}` });
+    lines.push({ t: 'row', left: L.maxPower, right: F.num(fleet?.powerMax, 1, L.packUnit.w) });
+    lines.push({ t: 'row', left: L.extremeCell, right: `${F.volts(fleet?.cellMin)} / ${F.volts(fleet?.cellMax)}` });
+    lines.push({ t: 'row', left: L.balancingCount, right: String(fleet?.balancing ?? 0) });
+    lines.push({ t: 'row', left: L.cyclesMax, right: isNum(fleet?.cyclesMax) ? String(fleet.cyclesMax) : F.na });
+    lines.push({ t: 'row', left: L.fetsOff, right: `${fleet?.chargeFetOff ?? 0}/${fleet?.dischargeFetOff ?? 0}` });
   }
   lines.push({ t: 'divider' });
 
-  lines.push({ t: 'text', text: 'BATTERIES', bold: true });
+  lines.push({ t: 'text', text: L.batteries, bold: true });
   rows.forEach((b, i) => {
     const st = b.stats;
     if (i > 0 && !brief) lines.push({ t: 'blank', n: 1 });
-    lines.push({ t: 'text', text: `${i + 1}. ${b.label} - ${b.connected ? 'online' : 'OFFLINE'}`, bold: true });
+    lines.push({ t: 'text', text: `${i + 1}. ${b.label} - ${b.connected ? L.online : L.offline}`, bold: true });
     if (!isNum(b.voltage) && !isNum(b.current) && !st) {
-      lines.push({ t: 'text', text: '- no data -' });
+      lines.push({ t: 'text', text: L.noData });
     } else if (brief) {
       // короткий чек: одна-две строки на плату — электрика и заряд
       const facts = [
-        num(b.voltage, 2, 'V'), num(b.current, 2, 'A'),
-        `SOC ${num(b.soc, 0, '%')}`, st ? `delta ${st.delta} mV` : '',
+        F.num(b.voltage, 2, L.packUnit.v), F.num(b.current, 2, L.packUnit.a),
+        `${L.chargeShort} ${F.num(b.soc, 0, L.packUnit.soc)}`, st ? `${L.deltaShort} ${st.delta} ${L.packUnit.mv}` : '',
       ];
       for (const s of packBits(facts, width)) lines.push({ t: 'text', text: s });
     } else {
       // средний чек: три смысловые строки — электрика · заряд и банки · крайние банки
       const groups = [
-        [num(b.voltage, 2, 'V'), num(b.current, 1, 'A'), num(b.power, 0, 'W')],
-        [`SOC ${num(b.soc, 0, '%')}`, `${b.cellCount || b.cells?.length || 0}S`, st ? `delta ${st.delta} mV` : ''],
-        st ? [`min ${volts(st.min)}`, `max ${volts(st.max)}`] : [],
+        [F.num(b.voltage, 2, L.packUnit.v), F.num(b.current, 1, L.packUnit.a), F.num(b.power, 0, L.packUnit.w)],
+        [`${L.chargeShort} ${F.num(b.soc, 0, L.packUnit.soc)}`, `${b.cellCount || b.cells?.length || 0}S`, st ? `${L.deltaShort} ${st.delta} ${L.packUnit.mv}` : ''],
+        st ? [`${L.min} ${F.volts(st.min)}`, `${L.max} ${F.volts(st.max)}`] : [],
       ];
       for (const g of groups) for (const s of packBits(g, width)) lines.push({ t: 'text', text: s });
     }
     if (full) {
       // полный чек: температуры, циклы, ключи и паспорт платы
       const extra = [
-        b.temperatures?.length ? `T ${b.temperatures.map((t) => (isNum(t) ? t.toFixed(1) : 'n/a')).join('/')} C` : '',
-        `cycles ${isNum(b.cycles) ? b.cycles : 'n/a'}`,
-        `balancing ${b.balancingCells?.length ?? 0}`,
-        `chg FET ${onOff(b.chargeFetOn)}`,
-        `dsg FET ${onOff(b.dischargeFetOn)}`,
-        b.model ? `model ${b.model}` : '',
-        b.hwVersion ? `hw ${b.hwVersion}` : '',
-        b.swVersion ? `fw ${b.swVersion}` : '',
-        b.serial ? `sn ${b.serial}` : '',
-        b.prodDate ? `made ${isoDate(b.prodDate)}` : '',
+        b.temperatures?.length
+          ? L.facts.sensors(b.temperatures.map((t) => (isNum(t) ? (ru ? t.toFixed(1).replace('.', ',') : t.toFixed(1)) : F.na)).join('/'))
+          : '',
+        `${L.facts.cycles} ${isNum(b.cycles) ? b.cycles : F.na}`,
+        `${L.facts.balancing} ${b.balancingCells?.length ?? 0}`,
+        `${L.facts.chargeFet} ${F.onOff(b.chargeFetOn)}`,
+        `${L.facts.dischargeFet} ${F.onOff(b.dischargeFetOn)}`,
+        b.model ? `${L.facts.model} ${b.model}` : '',
+        b.hwVersion ? `${L.facts.hardware} ${b.hwVersion}` : '',
+        b.swVersion ? `${L.facts.firmware} ${b.swVersion}` : '',
+        b.serial ? `${L.facts.serial} ${b.serial}` : '',
+        b.prodDate ? `${L.facts.made} ${ru ? b.prodDate : isoDate(b.prodDate)}` : '',
       ];
       for (const s of packBits(extra, width)) lines.push({ t: 'text', text: s });
     }
     const faults = brief ? (b.faults ?? []).slice(0, 2) : (b.faults ?? []);
-    for (const f of faults) lines.push({ t: 'text', text: `! ${faultName(f)}` });
+    for (const f of faults) lines.push({ t: 'text', text: `! ${faultOf(f)}` });
   });
   lines.push({ t: 'divider' });
-  lines.push({ t: 'text', text: 'Printed by JBD BMS', align: 1 });
-  lines.push({ t: 'text', text: fmtTime(Date.now()), align: 1 });
+  lines.push({ t: 'text', text: L.footer, align: 1 });
+  lines.push({ t: 'text', text: F.time(Date.now()), align: 1 });
   lines.push({ t: 'feed', n: 4 });
   return lines;
 }
@@ -828,4 +1105,7 @@ function svcError(status, code, message) {
   return e;
 }
 
-export { buildBankReceipt, buildFleetReceipt, buildTestPage, baudSweepLines, PRINTER_BAUDS };
+export {
+  buildBankReceipt, buildFleetReceipt, buildTestPage, baudSweepLines, PRINTER_BAUDS,
+  PRINTER_LANGUAGES, PRINTER_CHARSETS, CHARSET_CODEPAGE,
+};

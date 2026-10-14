@@ -1,7 +1,9 @@
 // Плитка «Чековый принтер»: выбор UART-порта TTL-принтера, скорости,
-// вид чека (короткий / средний / полный), кнопка «тестовая страница»,
+// вид чека (короткий / средний / полный), язык чека (английский / русский
+// с кодировкой cp866 / cp1251 / utf8), кнопка «тестовая страница»,
 // предпросмотр чека и главная кнопка «Распечатать сводку».
-// Чек на английском, только печатные ASCII-символы.
+// Английский чек — только печатные ASCII-символы (кириллица транслитом), русский — кириллица
+// в выбранной кодировке; выбор языка хранится в printer.json рядом с видом чека.
 // Мусор вместо текста (включая цифры и латиницу) — это несовпадение скорости
 // UART: «Найти скорость (авто)» перебирает скорости и форматы кадра и оставляет
 // ту, на которой принтер отвечает; «Печатать на всех скоростях» печатает блоки
@@ -9,10 +11,13 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api';
 import { REPORT_LEVELS, reportLevelInfo, reportLevelKey } from '../printer-levels';
+import {
+  PRINTER_CHARSETS, PRINTER_LANGUAGES, printerCharsetKey, printerLanguageInfo, printerLanguageKey,
+} from '../printer-languages';
 import { Btn, Chip } from './Tile';
 import type {
-  BankRow, PortItem, PrinterDetectResult, PrinterPreview, PrinterQueryResult, PrinterStatus, PrinterSweepResult,
-  ReportLevel,
+  BankRow, PortItem, PrinterCharset, PrinterDetectResult, PrinterLanguage, PrinterPreview, PrinterQueryResult,
+  PrinterStatus, PrinterSweepResult, ReportLevel,
 } from '../types';
 
 export function PrinterTile({
@@ -32,8 +37,10 @@ export function PrinterTile({
   const [baudRate, setBaudRate] = useState(9600);
   const [framing, setFraming] = useState('8N1');
   const [width, setWidth] = useState(32);
-  // вид чека: короткий, средний, полный — хранится в настройках принтера (printer.json)
+  // вид чека и язык хранятся в настройках принтера (printer.json)
   const [level, setLevel] = useState<ReportLevel>('medium');
+  const [language, setLanguage] = useState<PrinterLanguage>('en');
+  const [charset, setCharset] = useState<PrinterCharset>('cp866');
   const [pending, setPending] = useState(false);
   // какая длинная операция идёт: поиск скорости, перебор печатью или запрос состояния
   const [diagBusy, setDiagBusy] = useState<string | null>(null);
@@ -53,6 +60,8 @@ export function PrinterTile({
       setFraming(s.framing ?? '8N1');
       setWidth(s.width);
       setLevel(reportLevelKey(s.reportLevel));
+      setLanguage(printerLanguageKey(s.language));
+      setCharset(printerCharsetKey(s.charset));
     } catch (e: any) {
       note('err', e.message ?? 'Не удалось прочитать статус принтера');
     }
@@ -63,19 +72,20 @@ export function PrinterTile({
   const printTarget = () => (allBanks ? 'all' : (focus && banks.find((b) => b.id === focus)?.id) || banks[0]?.id || '');
 
   /** Предпросмотр: сводка по выбранному аккумулятору (или парку), без банков — пробная страница. */
-  const loadPreview = async (target = printTarget() || 'test', lvl = level) => {
+  const loadPreview = async (target = printTarget() || 'test', lvl = level, lang = language) => {
     try {
-      const query = `/api/printer/preview?id=${encodeURIComponent(target)}&level=${encodeURIComponent(lvl)}`;
+      const query = `/api/printer/preview?id=${encodeURIComponent(target)}`
+        + `&level=${encodeURIComponent(lvl)}&language=${encodeURIComponent(lang)}`;
       setPreview(await api<PrinterPreview>(query));
     } catch (e: any) {
       note('err', e.message ?? 'Не удалось показать чек');
     }
   };
 
-  // открытый предпросмотр следует за выбором аккумулятора / «все банки» / видов чека
+  // открытый предпросмотр следует за выбором аккумулятора / «все банки» / вида чека / языка и кодировки
   useEffect(() => {
     if (preview && preview.kind !== 'test') loadPreview();
-  }, [allBanks, focus, level]); // eslint-disable-line
+  }, [allBanks, focus, level, language, charset]); // eslint-disable-line
 
   const applyCfg = async (patch: Record<string, unknown>) => {
     setPending(true);
@@ -84,6 +94,7 @@ export function PrinterTile({
       if (s) {
         setStatus(s); setPath(s.path); setBaudRate(s.baudRate);
         setFraming(s.framing ?? '8N1'); setWidth(s.width); setLevel(reportLevelKey(s.reportLevel));
+        setLanguage(printerLanguageKey(s.language)); setCharset(printerCharsetKey(s.charset));
       }
       if (s && preview) loadPreview(preview.kind === 'test' ? 'test' : undefined);
     } finally { setPending(false); }
@@ -99,6 +110,41 @@ export function PrinterTile({
       const s = await onConfig({ reportLevel: next });
       if (s) setLevel(reportLevelKey(s.reportLevel));
       note('info', `Чек: ${info.label} — ${info.summary}.`);
+    } finally { setPending(false); }
+  };
+
+  /**
+   * Язык чека: сохраняется в printer.json (как и вид чека), поэтому кнопка в шапке
+   * и Ctrl+P печатают тем же языком. Порт при смене языка не переоткрывается: команда
+   * кодовой страницы (ESC t 17 для cp866 и ESC t 46 для cp1251) уходит перед каждой печатью.
+   */
+  const applyLanguage = async (next: PrinterLanguage) => {
+    if (next === language) return;
+    setLanguage(next);
+    const info = printerLanguageInfo(next);
+    setPending(true);
+    try {
+      const s = await onConfig({ language: next });
+      if (s) { setLanguage(printerLanguageKey(s.language)); setCharset(printerCharsetKey(s.charset)); }
+      // пробная страница зависит от языка: обновляем её, если она открыта
+      if (preview?.kind === 'test') loadPreview('test', level, next);
+      note('info', next === 'ru'
+        ? `Чек: русский, кодировка ${charset === 'utf8' ? 'utf8' : charset}. ${info.summary}.`
+        : `Чек: английский. ${info.summary}.`);
+    } finally { setPending(false); }
+  };
+
+  /** Смена кодировки: её легко перепутать, поэтому рядом кнопка «Пробная страница». */
+  const applyCharset = async (next: PrinterCharset) => {
+    if (next === charset) return;
+    setCharset(next);
+    setPending(true);
+    try {
+      const s = await onConfig({ charset: next });
+      if (s) setCharset(printerCharsetKey(s.charset));
+      // в предпросмотре от кодировки зависят байты для UART (текст тот же)
+      if (preview) loadPreview(preview.kind === 'test' ? 'test' : undefined);
+      note('info', `Кодировка русского чека: ${next}. Если на бумаге мусор вместо букв — смените на другую.`);
     } finally { setPending(false); }
   };
 
@@ -174,6 +220,10 @@ export function PrinterTile({
   const selectedBank = (focus && banks.find((b) => b.id === focus)) || banks[0] || null;
   const levelInfo = reportLevelInfo(level);
   const levelShown = preview?.level ? reportLevelInfo(preview.level) : levelInfo;
+  const languageInfo = printerLanguageInfo(language);
+  // в предпросмотре виден и язык, которым он отрисован
+  const previewLanguage = printerLanguageInfo(preview?.language ?? language);
+  const previewCharset = preview?.charset ?? null;
   const configured = Boolean(path);
   // порт принтера занят платой: опрос BMS каждую секунду печатает кадры dd a5 03 … вместо чека
   const portBusy = Boolean(status?.busy);
@@ -187,7 +237,7 @@ export function PrinterTile({
           принтер: {stateText}
         </span>
         <span className="muted tiny" title="Скорость, формат кадра и протокол должны совпадать с моделью принтера">
-          {baudRate} {framing} · чек на английском · вид: {levelInfo.label}
+          {baudRate} {framing} · чек {languageInfo.label === 'русский' ? `русский (${charset})` : 'на английском'} · вид: {levelInfo.label}
         </span>
         <button type="button" className="linkish small" onClick={() => setExpanded((v) => !v)}>
           {expanded ? 'свернуть ▴' : 'настроить ▾'}
@@ -222,6 +272,41 @@ export function PrinterTile({
         <span className="muted tiny" title={levelInfo.hint}>{levelInfo.summary}</span>
       </div>
 
+      {/* Язык чека: английский (ASCII, работает везде) или русский (кириллица в кодировке). */}
+      <div className="printer-row">
+        <span className="muted tiny">язык чека:</span>
+        <span className="chips report-levels" role="group" aria-label="Язык чека">
+          {PRINTER_LANGUAGES.map((l) => (
+            <Chip
+              key={l.key}
+              on={language === l.key}
+              disabled={locked}
+              onClick={() => applyLanguage(l.key)}
+              title={l.hint}
+            >
+              {l.label}
+            </Chip>
+          ))}
+        </span>
+        {language === 'ru' && (
+          <label className="printer-field inline" title="Кодовая страница принтера: у cp866 и cp1251 есть своя команда ESC t, у utf8 — нет">
+            <span className="muted tiny">кодировка</span>
+            <select value={charset} onChange={(e) => applyCharset(e.target.value as PrinterCharset)} disabled={locked}>
+              {PRINTER_CHARSETS.map((c) => <option key={c.key} value={c.key} title={c.hint}>{c.label}</option>)}
+            </select>
+          </label>
+        )}
+        <span className="muted tiny" title={languageInfo.hint}>{languageInfo.summary}</span>
+      </div>
+
+      {language === 'ru' && status?.profile === 'plain' && (
+        <div className="banner info small">
+          Профиль «Простой текст» не отправляет команду кодовой страницы (ESC t): русские буквы пойдут
+          только если принтер уже настроен на {charset}. В разделе «настроить» выберите «ESC/POS» или{' '}
+          «AlexGyver / TTL» — тогда приложение само переключит страницу (cp866 → ESC t 17, cp1251 → ESC t 46).
+        </div>
+      )}
+
       <div className="printer-main">
         <select
           value={path}
@@ -242,7 +327,7 @@ export function PrinterTile({
           className="b primary print-btn"
           onClick={doPrint}
           disabled={!configured || locked || !banks.length}
-          title={`Распечатать ${levelInfo.label} чек (на английском) со сводкой по ${allBanks ? 'всему парку' : (selectedBank?.label ?? 'аккумулятору')}. ${levelInfo.hint}`}
+          title={`Распечатать ${levelInfo.label} чек на ${languageInfo.label === 'русский' ? `русском языке (${charset})` : 'английском языке'} со сводкой по ${allBanks ? 'всему парку' : (selectedBank?.label ?? 'аккумулятору')}. ${levelInfo.hint}`}
         >
           🖶 {busy === 'printer' ? 'Печать…' : `Печать: ${levelInfo.label}`}
         </button>
@@ -292,7 +377,11 @@ export function PrinterTile({
         <div className="printer-preview">
           <div className="printer-row">
             <span className="muted tiny">
-              так чек ляжет на бумагу · {levelShown.label} · {preview.lines.length} строк · {preview.width} симв. в строке · английский, ASCII
+              так чек ляжет на бумагу · {levelShown.label} · {preview.lines.length} строк · {preview.width} симв. в строке ·{' '}
+              {previewLanguage.label === 'русский'
+                ? `русский, ${previewCharset ?? 'cp866'}`
+                : 'английский, ASCII'}
+              {preview.bytes?.length ? ` · ${preview.bytes.length} байт` : ''}
             </span>
             <button type="button" className="linkish small" onClick={() => loadPreview(preview.kind === 'test' ? 'test' : undefined)}>обновить</button>
           </div>
@@ -356,6 +445,14 @@ export function PrinterTile({
               Проверено комбинаций: {detect.tried}. Ни одна не ответила — {detect.message}
             </div>
           )}
+          <p className="muted tiny">
+            <b>Русский чек.</b> Английский чек — только ASCII и работает на любом принтере. Русский печатается
+            кириллицей в выбранной кодировке: <b>cp866</b> (кодовая страница ESC t 17), <b>cp1251</b> (ESC t 46)
+            или <b>utf8</b>. При печати приложение отправляет команду страницы (кроме профиля «Простой текст») —
+            если в шрифте принтера есть русские буквы, чек выйдет читаемым. Вместо букв мусор (обычно при этом
+            латиница и цифры читаются) — не та кодировка: смените её и нажмите «Пробная страница». Если мусор
+            на всех кодировках — русских букв в шрифте нет, верните английский: транслит читается всегда.
+          </p>
           <p className="muted tiny">
             <b>Если на бумаге мусор вместо букв и цифр</b> — это не текст и не кодировка, а линия: принтер читает
             байты на другой скорости. Нажмите <b>«Найти скорость (авто)»</b>: приложение переберёт 9600/19200/38400/

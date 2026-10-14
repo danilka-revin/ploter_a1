@@ -394,12 +394,26 @@ export interface PortsResponseExtended extends PortsResponse {
 /** Вид чека принтера: короткий, средний, полный. */
 export type ReportLevel = 'short' | 'medium' | 'full';
 
+/** Язык чека: en — английский (ASCII), ru — русский (кириллица). */
+export type PrinterLanguage = 'en' | 'ru';
+
+/** Кодировка кириллицы для русского чека. */
+export type PrinterCharset = 'cp866' | 'cp1251' | 'utf8';
+
 export interface PrinterStatus {
   profile: 'plain' | 'escpos' | 'alexgyver';
   lineDelayMs: number;
   /** вид чека по умолчанию: короткий (short), средний (medium), полный (full) */
   reportLevel: ReportLevel;
   reportLevels: ReportLevel[];
+  /** язык чека: en — английский (ASCII), ru — русский (кириллица) */
+  language: PrinterLanguage;
+  languages: PrinterLanguage[];
+  /** кодировка кириллицы для русского чека: cp866, cp1251 или utf8 */
+  charset: PrinterCharset;
+  charsets: PrinterCharset[];
+  /** номера страниц ESC t n: PC866 = 17, WPC1251 = 46, utf8 — номера нет */
+  charsetCodepages: Record<string, number | null>;
   printing: boolean;
   configured: boolean;
   path: string;
@@ -407,8 +421,6 @@ export interface PrinterStatus {
   /** формат кадра UART: 8N1 (обычный), 8E1, 7E1 */
   framing: string;
   width: number;
-  /** язык чека: английский, ASCII; требуется совместимый транспорт/протокол */
-  language: 'en';
   open: boolean;
   lastError: string;
   lastPrintAt: number;
@@ -463,13 +475,25 @@ export interface PrinterSweepResult {
   message: string;
 }
 
-/** Чек обычным текстом, как он ляжет на бумагу (GET /api/printer/preview). */
+/**
+ * Чек текстом, как он ляжет на бумагу (GET /api/printer/preview).
+ * `lines` и `text` — один и тот же текст чека, `bytes` — ровно те байты,
+ * что уйдут в UART (в русском чеке старшие байты — кириллица).
+ */
 export interface PrinterPreview {
   kind: 'bank' | 'fleet' | 'test';
   /** вид чека: у пробной страницы его нет */
   level: ReportLevel | null;
   width: number;
   lines: string[];
+  text: string[];
+  language: PrinterLanguage;
+  /** кодировка кириллицы: null при английском чеке */
+  charset: PrinterCharset | null;
+  bytes: number[];
+  byteLength: number;
+  /** весь чек — чистый ASCII (английский режим без кириллицы) */
+  ascii: boolean;
 }
 
 export interface PrintResult {
@@ -481,4 +505,7 @@ export interface PrintResult {
   banks?: number;
   /** каким видом чека напечатано: коротким, средним или полным */
   level?: ReportLevel;
+  /** на каком языке напечатано */
+  language?: PrinterLanguage;
+  charset?: PrinterCharset;
 }

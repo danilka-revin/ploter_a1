@@ -394,7 +394,7 @@ export function useCockpit() {
     try {
       const body = level ? { id, level } : { id };
       const r = await api<PrintResult>('/api/printer/print', { method: 'POST', body: JSON.stringify(body) }, 600_000);
-      const kind = `чек ${reportLevelLabel(r.level ?? level)}`;
+      const kind = `чек ${reportLevelLabel(r.level ?? level)}${r.language === 'ru' ? ` на русском (${r.charset ?? 'cp866'})` : r.language ? ' на английском' : ''}`;
       if (r.banks != null) note('ok', `Сводка по парку (${r.banks} плат) отправлена на печать · ${kind}.`);
       else note('ok', `Сводка по «${r.bank ?? 'аккумулятору'}» отправлена на печать · ${kind}.`);
     } catch (e: any) { note('err', e.message ?? 'Печать сводки не удалась'); }
