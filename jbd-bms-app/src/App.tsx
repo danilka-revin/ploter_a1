@@ -102,6 +102,10 @@ export default function App() {
         e.preventDefault();
         if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
         else document.documentElement.requestFullscreen?.().catch(() => {});
+      } else if ((e.ctrlKey || e.metaKey) && k === 'p') {
+        e.preventDefault();
+        const id = (isFleet || !activeBank) ? 'all' : activeBank.id;
+        cockpit.printSummary(id);
       } else if (k === 'd') cockpit.addDemo();
       else if (k === 's') cockpit.findAndConnectAll();
       else if (k === 'j') setJournalOpen((v) => !v);
@@ -112,7 +116,7 @@ export default function App() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [banks, cockpit]);
+  }, [banks, cockpit, isFleet, activeBank]);
 
   const faultLabels = useMemo(() => Object.fromEntries((catalog?.faults ?? []).map((f) => [f.key, f.label])), [catalog]);
   const alertCount = (fleet?.faults ?? 0) + banks.filter((b) => !b.connected).length;
@@ -150,6 +154,10 @@ export default function App() {
           </span>
           <Btn small onClick={cockpit.exportCsv} title="Отчёт по всем банкам в CSV">CSV отчёт</Btn>
           <Btn small onClick={cockpit.exportJson} title="Полный отчёт в JSON">JSON</Btn>
+          <Btn small
+            onClick={() => cockpit.printSummary(cockpit.focusBank?.id ? cockpit.focusBank.id : 'all')}
+            title="Распечатать сводку по аккумулятору на TTL-чковом принтере (Ctrl+P)"
+          >🖶 Печать</Btn>
           <button className="ic" onClick={() => setDensity(density === 'compact' ? 'roomy' : 'compact')} title="Плотность панели">{density === 'compact' ? '⤡' : '⤢'}</button>
           <button className="ic" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')} title="Тема">{theme === 'dark' ? '☀' : '☾'}</button>
           <button className="ic" onClick={() => document.documentElement.requestFullscreen?.().catch(() => {})} title="Полный экран (F)">⛶</button>
@@ -244,14 +252,17 @@ export default function App() {
         />
       </Tile>
 
-      <Tile title="Порты и подключение" area="cnc" hint="USB–UART 9600 8N1">
+      <Tile title="Порты и подключение" area="cnc" hint="USB–UART 9600 8N1 · TTL-принтер чеков 5–9В">
         <ConnectTile
           ports={cockpit.ports} selected={cockpit.selected} onSelect={cockpit.setSelected}
           onConnect={() => cockpit.addBank(cockpit.selected)}
           onFind={cockpit.findAndConnectAll}
           onDemo={cockpit.addDemo}
           busy={cockpit.busy} scanning={cockpit.scanning}
-          banks={banks} catalog={catalog}
+          banks={banks} focus={focus}
+          printerConfig={cockpit.printerConfig} printerTest={cockpit.printerTest} printSummary={cockpit.printSummary}
+          note={cockpit.note}
+          catalog={catalog}
         />
       </Tile>
 

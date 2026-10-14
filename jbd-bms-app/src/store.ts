@@ -8,7 +8,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from './api';
 import type {
-  BankRegisters, BankRow, Catalog, ControlResponse, Panel, PortItem, RawReadResponse, RawWriteResponse, Series,
+  BankRegisters, BankRow, Catalog, ControlResponse, Panel, PortItem, PrinterStatus, RawReadResponse, RawWriteResponse, Series,
 } from './types';
 
 const WINDOW_KEY = 'jbd.window';
@@ -358,11 +358,49 @@ export function useCockpit() {
     }
   }, [note]);
 
+  // ----- чековый принтер -----
+  const printerStatus = useCallback(async (): Promise<PrinterStatus | null> => {
+    try { return await api<PrinterStatus>('/api/printer'); }
+    catch (e: any) { note('err', e.message ?? 'Не удалось получить статус принтера.'); return null; }
+  }, [note]);
+
+  const printerConfig = useCallback(async (patch: Record<string, unknown>): Promise<PrinterStatus | null> => {
+    setBusy('printer-cfg');
+    try {
+      const s = await api<PrinterStatus>('/api/printer/config', { method: 'POST', body: JSON.stringify(patch) }, 10_000);
+      note('ok', `Принтер: ${s.path || 'порт не выбран'} @ ${s.baudRate}.`);
+      return s;
+    } catch (e: any) { note('err', e.message ?? 'Настройки принтера не сохранены.'); return null; }
+    finally { if (alive.current) setBusy(null); }
+  }, [note]);
+
+  const printerTest = useCallback(async () => {
+    setBusy('printer-test');
+    try {
+      const r = await api<any>('/api/printer/test', { method: 'POST' }, 20_000);
+      note('ok', `Пробный чек напечатан (${r.path} @ ${r.baudRate}).`);
+    } catch (e: any) { note('err', e.message ?? 'Печать не удалась'); }
+    finally { if (alive.current) setBusy(null); }
+  }, [note]);
+
+  const printSummary = useCallback(async (id: string) => {
+    setBusy('printer');
+    try {
+      const r = await api<any>('/api/printer/print', { method: 'POST', body: JSON.stringify({ id }) }, 30_000);
+      if (r.banks != null) note('ok', `Сводка по парку (${r.banks} плат) отправлена на печать.`);
+      else note('ok', `Сводка по «${r.bank ?? 'аккумулятору'}» отправлена на печать.`);
+    } catch (e: any) { note('err', e.message ?? 'Печать сводки не удалась'); }
+    finally { if (alive.current) setBusy(null); }
+  }, [note]);
+
+  const setBusyExt = useCallback((k: string | null) => setBusy(k), []);
+
   return {
     panel, catalog, ports, demoPort, selected, setSelected, windowSec, setWindowSec, WINDOW_OPTIONS,
     focus, setFocus, focusBank, series, registers, log, busy, error, pollMs, scanning,
     refresh, refreshPorts, addBank, addDemo, findAndConnectAll, removeBank, renameBank, reconnectBank, setRate,
     readRegisters, writeSettings, control, rawRead, rawWrite, backup, restore, exportCsv, exportJson, note,
+    printerStatus, printerConfig, printerTest, printSummary, setBusy: setBusyExt,
   };
 }
 

@@ -2,6 +2,7 @@
 import { useMemo, useState } from 'react';
 import { Spark, Trend, Gauge, CellBars } from '../charts';
 import { Btn, Chip, num } from './Tile';
+import { PrinterTile } from './Printer';
 import type { BankRow, Catalog, Fleet, Panel, PortItem, Series } from '../types';
 
 export const C = {
@@ -456,7 +457,8 @@ export function Charts({
 
 /** Подключение: список портов, кнопки поиска и демо, список занятых портов. */
 export function ConnectTile({
-  ports, selected, onSelect, onConnect, onFind, onDemo, busy, scanning, banks,
+  ports, selected, onSelect, onConnect, onFind, onDemo, busy, scanning, banks, focus,
+  printerConfig, printerTest, printSummary, note,
 }: {
   ports: (PortItem & { used?: boolean })[];
   selected: string;
@@ -467,6 +469,11 @@ export function ConnectTile({
   busy: string | null;
   scanning: boolean;
   banks: BankRow[];
+  focus: string | null;
+  printerConfig: (patch: Record<string, unknown>) => Promise<any>;
+  printerTest: () => Promise<void>;
+  printSummary: (id: string) => Promise<void>;
+  note: (kind: 'ok' | 'err' | 'info', text: string) => void;
   catalog?: Catalog | null;
 }) {
   const [showHelp, setShowHelp] = useState(false);
@@ -511,6 +518,13 @@ export function ConnectTile({
           </span>
         ))}
         {!banks.length && <span className="muted small">пока пусто</span>}
+      </div>
+
+      <div className="printer-block">
+        <PrinterTile
+          ports={ports} banks={banks} focus={focus} busy={busy}
+          onConfig={printerConfig} onTest={printerTest} onPrint={printSummary} note={note}
+        />
       </div>
     </div>
   );

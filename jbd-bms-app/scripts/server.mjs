@@ -31,6 +31,10 @@
 //   GET  /api/history?id=&seconds=        — история выборок банка для графиков
 //   GET  /api/catalog                     — описания регистров, настроек и команд
 //   POST /api/poll {ms}                    — задать период опроса
+//   GET  /api/printer                     — статус TTL-чекового принтера
+//   POST /api/printer/config              — настройки принтера (порт, скорость, кодировка)
+//   POST /api/printer/test                — пробная страница
+//   POST /api/printer/print {id}          — печать сводки по банку (id=all — по парку)
 //
 // Старые одиночные адреса сохранены: /api/connect, /api/disconnect, /api/state,
 // /api/snapshot, /api/settings, /api/settings/write, /api/control/*, /api/backup*,
@@ -55,6 +59,7 @@ import { scanBmsPorts } from './port-scan.mjs';
 import { inspectFirmwareFile, flashFirmware, FirmwareError } from './firmware.mjs';
 import { createUpdater, RESTART_EXIT_CODE } from './updater.mjs';
 import { parseIntelHex } from './intel-hex.mjs';
+import { PrinterService } from './printer-service.mjs';
 
 const APP_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const DIST = join(APP_DIR, 'dist');
@@ -80,6 +85,8 @@ export const banks = new BankManager({
   log: (m) => console.log('банк: ' + m),
 });
 banks.start();
+
+export const printer = new PrinterService({ log: (m) => console.log('принтер: ' + m) });
 
 const firmware = { text: null, name: '' };
 
@@ -375,6 +382,31 @@ async function handleApi(req, res, url) {
   if (method === 'POST' && pathname === '/api/control/clear-errors') {
     const body = await readJson(req);
     return send(res, 200, await banks.control(primaryId(), 'clear-errors', body));
+  }
+
+  // ----- чековый принтер (UART TTL) -----
+  if (method === 'GET' && pathname === '/api/printer') {
+    return send(res, 200, printer.status());
+  }
+  if (method === 'POST' && pathname === '/api/printer/config') {
+    const body = await readJson(req);
+    return send(res, 200, printer.configure(body));
+  }
+  if (method === 'POST' && pathname === '/api/printer/test') {
+    return send(res, 200, await printer.testPage());
+  }
+  if (method === 'POST' && pathname === '/api/printer/print') {
+    const body = await readJson(req);
+    const target = body.id === 'all' || body.all ? null : (body.id || null);
+    if (target === null) {
+      const rows = banks.list().map((b) => banks.row(b));
+      if (!rows.length) throw httpError(409, 'NO_BANK', 'Нет подключённых аккумуляторов.');
+      return send(res, 200, await printer.printFleet(rows, banks.fleet()));
+    }
+    const bank = banks.get(target);
+    // обновляем данные, если банк на связи; не падаем, если опрос не удался — печатаем то, что есть
+    if (bank.connected) await banks.pollOne(bank).catch(() => {});
+    return send(res, 200, await printer.printBank(banks.row(bank), banks.fleet()));
   }
 
   // ----- прошивка -----
